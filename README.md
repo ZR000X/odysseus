@@ -73,6 +73,46 @@ binds the web UI to `127.0.0.1` by default. If the port is taken, set
 `APP_PORT=7001` in `.env` and recreate the container. Set `APP_BIND=0.0.0.0`
 only when you intentionally want LAN/reverse-proxy access.
 
+#### Parallel dev stack (optional)
+
+To run a **second** Compose project alongside an existing install (separate
+ports and data — production on `:7000` stays up):
+
+```bash
+cp .env.dev.example .env.dev
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --build
+```
+
+Open `http://localhost:7001`. Stop or inspect **only** the dev stack with the
+same `-f` / `--env-file .env.dev` flags (`down`, `logs odysseus`, etc.). A plain
+`docker compose down` without those flags affects whichever project your default
+`.env` points at.
+
+**First-login admin password** is printed once at container startup when
+`data-dev/auth.json` is created (dev credentials are separate from production
+`data/auth.json`). Always pass the dev compose flags — a plain
+`docker compose logs odysseus` only shows the production stack:
+
+```bash
+# Dev stack
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs odysseus | grep -i password
+
+# Production (default project)
+docker compose logs odysseus | grep -i password
+```
+
+PowerShell:
+
+```powershell
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs odysseus | Select-String -Pattern password
+```
+
+If you missed the one-time log line, set `ODYSSEUS_ADMIN_PASSWORD` in `.env.dev`,
+delete `data-dev/auth.json`, and recreate the dev container. With that env var
+set, setup uses your password and does not print it in logs.
+
+GPU on dev: add `-f docker/gpu.nvidia.yml` (or `gpu.amd.yml`) after `docker/dev.yml` (see `.env.dev.example`).
+
 ### Native Linux / macOS
 ```bash
 git clone https://github.com/pewdiepie-archdaemon/odysseus.git
