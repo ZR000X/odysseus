@@ -284,6 +284,38 @@ async def test_do_manage_atlas_insert_one(atlas_env, monkeypatch):
     assert r3.get("inserted_id")
 
 
+@pytest.mark.asyncio
+async def test_update_world_rename(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Alpha")
+    updated = atlas_env["worlds"].update_world(atlas_env["owner"], w["id"], name="Beta")
+    assert updated["name"] == "Beta"
+
+
+@pytest.mark.asyncio
+async def test_list_worlds_archived_filter(atlas_env):
+    w1 = atlas_env["worlds"].create_world(atlas_env["owner"], "Active One")
+    w2 = atlas_env["worlds"].create_world(atlas_env["owner"], "To Archive")
+    atlas_env["worlds"].update_world(atlas_env["owner"], w2["id"], archived=True)
+    active = atlas_env["worlds"].list_worlds(atlas_env["owner"], archived=False)
+    archived = atlas_env["worlds"].list_worlds(atlas_env["owner"], archived=True)
+    assert len(active) == 1
+    assert active[0]["id"] == w1["id"]
+    assert len(archived) == 1
+    assert archived[0]["id"] == w2["id"]
+    assert archived[0]["archived"] is True
+
+
+@pytest.mark.asyncio
+async def test_delete_world(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Doomed")
+    db_file = w["db_path"]
+    assert os.path.isfile(db_file)
+    atlas_env["worlds"].delete_world(atlas_env["owner"], w["id"])
+    assert not os.path.isfile(db_file)
+    with pytest.raises(atlas_env["worlds"].AtlasNotFoundError):
+        atlas_env["worlds"].get_world(atlas_env["owner"], w["id"])
+
+
 def test_legacy_world_db_gets_v2_tables(atlas_env):
     """Opening a pre-v2 world DB adds atlas_fields and related tables."""
     wdb = sys.modules["services.atlas.world_db"]

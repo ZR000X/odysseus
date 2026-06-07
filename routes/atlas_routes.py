@@ -26,6 +26,12 @@ class WorldCreate(BaseModel):
     description: str = ""
 
 
+class WorldUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    archived: Optional[bool] = None
+
+
 class EntityCreate(BaseModel):
     name: str
     description: str = ""
@@ -116,9 +122,9 @@ def setup_atlas_routes() -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/atlas/worlds")
-    async def list_worlds(request: Request):
+    async def list_worlds(request: Request, archived: Optional[bool] = None):
         owner = _owner(request)
-        return {"worlds": atlas_worlds.list_worlds(owner)}
+        return {"worlds": atlas_worlds.list_worlds(owner, archived=archived)}
 
     @router.post("/api/atlas/worlds")
     async def create_world(request: Request, body: WorldCreate):
@@ -126,6 +132,26 @@ def setup_atlas_routes() -> APIRouter:
         try:
             w = atlas_worlds.create_world(owner, body.name, body.description)
             return w
+        except Exception as e:
+            _handle_err(e)
+
+    @router.put("/api/atlas/worlds/{world_id}")
+    async def update_world(request: Request, world_id: str, body: WorldUpdate):
+        owner = _owner(request)
+        try:
+            return atlas_worlds.update_world(
+                owner, world_id,
+                name=body.name, description=body.description, archived=body.archived,
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    @router.delete("/api/atlas/worlds/{world_id}")
+    async def delete_world(request: Request, world_id: str):
+        owner = _owner(request)
+        try:
+            atlas_worlds.delete_world(owner, world_id)
+            return {"ok": True}
         except Exception as e:
             _handle_err(e)
 

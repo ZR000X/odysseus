@@ -1521,6 +1521,7 @@ class AtlasWorld(TimestampMixin, Base):
     entity_count = Column(Integer, default=0, nullable=False)
     row_count = Column(Integer, default=0, nullable=False)
     schema_version = Column(Integer, default=1, nullable=False)
+    archived = Column(Boolean, default=False, nullable=False)
 
     __table_args__ = (
         Index("ix_atlas_worlds_owner_updated", "owner", "updated_at"),
@@ -1757,6 +1758,11 @@ def _migrate_add_atlas_worlds_table():
                 "CREATE INDEX IF NOT EXISTS ix_atlas_worlds_owner_updated "
                 "ON atlas_worlds (owner, updated_at)"
             ))
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(atlas_worlds)"))]
+            if "archived" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE atlas_worlds ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"
+                ))
             conn.commit()
             logging.getLogger(__name__).info("Atlas worlds registry table ready")
     except Exception as e:

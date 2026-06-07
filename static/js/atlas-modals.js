@@ -174,3 +174,193 @@ export function promptImportJson() {
     { submitLabel: 'Import' },
   );
 }
+
+export function promptTypeToConfirm(expectedName, message) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal atlas-modal';
+    wrap.innerHTML = `
+      <div class="modal-content atlas-modal-content" style="max-width:420px">
+        <div class="modal-header">
+          <h4>Delete world</h4>
+          <button type="button" class="close-btn atlas-modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body atlas-modal-body">
+          <p style="margin:0 0 12px;font-size:13px">${_esc(message)}</p>
+          <label class="atlas-form-label">Type <strong>${_esc(expectedName)}</strong> to confirm
+            <input type="text" class="atlas-form-input" id="atlas-type-confirm" autocomplete="off" />
+          </label>
+        </div>
+        <div class="modal-footer atlas-modal-footer" style="display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;border-top:1px solid var(--border)">
+          <button type="button" class="admin-btn-sm atlas-modal-cancel">Cancel</button>
+          <button type="button" class="admin-btn-sm atlas-modal-submit atlas-delete-confirm" disabled style="background:#dc2626;color:#fff">Delete</button>
+        </div>
+      </div>`;
+    const close = (val) => { wrap.remove(); resolve(val); };
+    const input = wrap.querySelector('#atlas-type-confirm');
+    const delBtn = wrap.querySelector('.atlas-delete-confirm');
+    input?.addEventListener('input', () => {
+      delBtn.disabled = input.value !== expectedName;
+    });
+    wrap.querySelector('.atlas-modal-close')?.addEventListener('click', () => close(false));
+    wrap.querySelector('.atlas-modal-cancel')?.addEventListener('click', () => close(false));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) close(false); });
+    delBtn?.addEventListener('click', () => { if (input?.value === expectedName) close(true); });
+    document.body.appendChild(wrap);
+    input?.focus();
+  });
+}
+
+function _docForEdit(doc) {
+  const body = { ...doc };
+  delete body._atlas_created_at;
+  delete body._atlas_updated_at;
+  delete body._atlas_row_id;
+  return body;
+}
+
+export function promptEditDocument(doc) {
+  const raw = JSON.stringify(_docForEdit(doc), null, 2);
+  return _modal(
+    'Edit Document',
+    `<label class="atlas-form-label">Document JSON<textarea class="atlas-form-input" id="atlas-doc-json" rows="14" style="font-family:ui-monospace,monospace;font-size:11px">${_esc(raw)}</textarea></label>`,
+    (wrap) => {
+      const text = wrap.querySelector('#atlas-doc-json')?.value?.trim();
+      if (!text) throw new Error('Document JSON is required');
+      let parsed;
+      try { parsed = JSON.parse(text); } catch { throw new Error('Invalid JSON'); }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Document must be a JSON object');
+      }
+      return { document: parsed, docId: doc._id ?? doc._atlas_row_id };
+    },
+    { submitLabel: 'Save' },
+  );
+}
+
+export function openWorldsManager({
+  fetchWorlds, activeWorldId, onSwitch, apiBase,
+}) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal atlas-modal';
+    wrap.innerHTML = `
+      <div class="modal-content atlas-modal-content atlas-worlds-modal" style="max-width:520px">
+        <div class="modal-header">
+          <h4>Worlds</h4>
+          <button type="button" class="close-btn atlas-modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body atlas-modal-body">
+          <div class="atlas-worlds-tabs">
+            <button type="button" class="atlas-worlds-tab active" data-tab="active">Active</button>
+            <button type="button" class="atlas-worlds-tab" data-tab="archived">Archived</button>
+          </div>
+          <div id="atlas-worlds-list" class="atlas-worlds-list"></div>
+        </div>
+      </div>`;
+
+    let tab = 'active';
+    let worlds = [];
+
+    const close = () => { wrap.remove(); resolve(); };
+
+    async function loadList() {
+      const listEl = wrap.querySelector('#atlas-worlds-list');
+      if (!listEl) return;
+      listEl.innerHTML = '<div class="atlas-empty">Loading…</div>';
+      try {
+        worlds = await fetchWorlds(tab === 'archived');
+        if (!worlds.length) {
+          listEl.innerHTML = `<div class="atlas-empty">No ${tab} worlds.</div>`;
+          return;
+        }
+        listEl.innerHTML = worlds.map(w => {
+          const updated = w.updated_at ? new Date(w.updated_at).toLocaleDateString() : '';
+          const isActive = w.id === activeWorldId;
+          return `<div class="atlas-world-row${isActive ? ' atlas-world-row-active' : ''}" data-world-id="${_esc(w.id)}">
+            <div class="atlas-world-row-main">
+              <div class="atlas-world-row-name">${_esc(w.name)}${isActive ? ' <span class="atlas-world-current">current</span>' : ''}</div>
+              <div class="atlas-world-row-meta">${w.entity_count || 0} collections · ${w.row_count || 0} docs · ${updated}</div>
+            </div>
+            <div class="atlas-world-row-actions">
+              ${tab === 'active' ? `<button type="button" class="admin-btn-sm atlas-world-open" data-id="${_esc(w.id)}">Open</button>` : ''}
+              <button type="button" class="admin-btn-sm atlas-world-rename" data-id="${_esc(w.id)}">Rename</button>
+              ${tab === 'active'
+    ? `<button type="button" class="admin-btn-sm atlas-world-archive" data-id="${_esc(w.id)}">Archive</button>`
+    : `<button type="button" class="admin-btn-sm atlas-world-restore" data-id="${_esc(w.id)}">Restore</button>`}
+              <button type="button" class="admin-btn-sm atlas-world-delete" data-id="${_esc(w.id)}" data-name="${_esc(w.name)}" style="color:#dc2626">Delete</button>
+            </div>
+          </div>`;
+        }).join('');
+      } catch (e) {
+        listEl.innerHTML = `<div class="atlas-empty">${_esc(e.message)}</div>`;
+      }
+    }
+
+    wrap.querySelector('.atlas-modal-close')?.addEventListener('click', close);
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) close(); });
+
+    wrap.querySelector('.atlas-worlds-tabs')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.atlas-worlds-tab');
+      if (!btn) return;
+      tab = btn.dataset.tab;
+      wrap.querySelectorAll('.atlas-worlds-tab').forEach(t => t.classList.toggle('active', t === btn));
+      await loadList();
+    });
+
+    wrap.querySelector('#atlas-worlds-list')?.addEventListener('click', async (e) => {
+      const openBtn = e.target.closest('.atlas-world-open');
+      const renameBtn = e.target.closest('.atlas-world-rename');
+      const archiveBtn = e.target.closest('.atlas-world-archive');
+      const restoreBtn = e.target.closest('.atlas-world-restore');
+      const deleteBtn = e.target.closest('.atlas-world-delete');
+
+      if (openBtn) {
+        await onSwitch(openBtn.dataset.id, 'open');
+        close();
+        return;
+      }
+      if (renameBtn) {
+        const w = worlds.find(x => x.id === renameBtn.dataset.id);
+        if (!w) return;
+        const name = await uiModule.styledPrompt(`Rename "${w.name}"`, {
+          title: 'Rename world', defaultValue: w.name, confirmText: 'Save',
+        });
+        if (!name || name === w.name) return;
+        await onSwitch(w.id, 'rename', { name });
+        await loadList();
+        return;
+      }
+      if (archiveBtn) {
+        await onSwitch(archiveBtn.dataset.id, 'archive');
+        await loadList();
+        return;
+      }
+      if (restoreBtn) {
+        const w = worlds.find(x => x.id === restoreBtn.dataset.id);
+        if (!w) return;
+        await onSwitch(w.id, 'restore', { name: w.name });
+        await loadList();
+        return;
+      }
+      if (deleteBtn) {
+        const name = deleteBtn.dataset.name;
+        const ok = await promptTypeToConfirm(
+          name,
+          `This permanently deletes "${name}" and all its data. This cannot be undone.`,
+        );
+        if (!ok) return;
+        await onSwitch(deleteBtn.dataset.id, 'delete', { name });
+        await loadList();
+      }
+    });
+
+    document.body.appendChild(wrap);
+    const content = wrap.querySelector('.modal-content');
+    const header = wrap.querySelector('.modal-header');
+    if (content && header) {
+      makeWindowDraggable(wrap, { content, header, skipSelector: 'button, input, select, textarea, label', enableDock: true });
+    }
+    loadList();
+  });
+}

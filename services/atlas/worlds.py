@@ -27,6 +27,7 @@ def _world_to_dict(w: AtlasWorld) -> Dict[str, Any]:
         "entity_count": w.entity_count or 0,
         "row_count": w.row_count or 0,
         "schema_version": w.schema_version or 1,
+        "archived": bool(w.archived),
         "created_at": w.created_at.isoformat() if w.created_at else None,
         "updated_at": w.updated_at.isoformat() if w.updated_at else None,
     }
@@ -39,10 +40,12 @@ def _owner_query(q, owner: Optional[str]):
     return q.filter(AtlasWorld.owner == owner)
 
 
-def list_worlds(owner: Optional[str]) -> List[Dict[str, Any]]:
+def list_worlds(owner: Optional[str], *, archived: Optional[bool] = None) -> List[Dict[str, Any]]:
     db = SessionLocal()
     try:
         q = _owner_query(db.query(AtlasWorld), owner)
+        if archived is not None:
+            q = q.filter(AtlasWorld.archived == archived)
         rows = q.order_by(AtlasWorld.updated_at.desc()).all()
         return [_world_to_dict(w) for w in rows]
     finally:
@@ -77,8 +80,37 @@ def create_world(owner: Optional[str], name: str, description: str = "") -> Dict
             entity_count=0,
             row_count=0,
             schema_version=2,
+            archived=False,
         )
         db.add(w)
+        db.commit()
+        db.refresh(w)
+        return _world_to_dict(w)
+    finally:
+        db.close()
+
+
+def update_world(
+    owner: Optional[str],
+    world_id: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    archived: Optional[bool] = None,
+) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        w = db.query(AtlasWorld).filter(AtlasWorld.id == world_id).first()
+        if not w:
+            raise AtlasNotFoundError(f"World not found: {world_id}")
+        if owner is not None and w.owner != owner:
+            raise AtlasAccessError("World not accessible")
+        if name is not None:
+            w.name = name.strip() or "Untitled World"
+        if description is not None:
+            w.description = description
+        if archived is not None:
+            w.archived = archived
         db.commit()
         db.refresh(w)
         return _world_to_dict(w)
@@ -108,7 +140,7 @@ def delete_world(owner: Optional[str], world_id: str) -> bool:
 
 
 def resolve_default_world(owner: Optional[str]) -> Dict[str, Any]:
-    worlds = list_worlds(owner)
+    worlds = list_worlds(owner, archived=False)
     if worlds:
         return worlds[0]
     return create_world(owner, "My World")

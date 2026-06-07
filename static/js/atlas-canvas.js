@@ -2,10 +2,16 @@
  * Atlas world canvas — Obsidian-style pan/zoom entity graph.
  */
 import uiModule from './ui.js';
-import { promptEntity, promptRelationship, promptWorld, promptEditEntity } from './atlas-modals.js';
+import { promptEntity, promptRelationship, promptWorld, promptEditEntity, openWorldsManager } from './atlas-modals.js';
+import {
+  toastBrowsing, toastWorldCreated, toastCollectionCreated, toastCollectionUpdated,
+  toastConnectionLocked, toastWorldSwitched,
+  toastWorldArchived, toastWorldRestored, toastWorldDeleted, toastWorldRenamed,
+} from './atlas-toast.js';
 
 const API_BASE = window.location.origin;
 const PORT_ANCHORS = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
+const MOVE_THRESHOLD = 5;
 
 let _container = null;
 let _worldId = null;
@@ -91,7 +97,7 @@ function _renderEdges(svg) {
     const mx = (from.x + to.x) / 2;
     const d = `M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}`;
     const color = r.rel_type === 'one_to_one' ? 'var(--accent)' : r.rel_type === 'many_to_many' ? '#f0abfc' : 'var(--fg)';
-    return `<path class="atlas-edge" data-rel-id="${r.id}" d="${d}" stroke="${color}" fill="none" stroke-width="2" opacity="0.55"/>`;
+    return `<path class="atlas-edge atlas-edge-draw" data-rel-id="${r.id}" d="${d}" stroke="${color}" fill="none" stroke-width="2" opacity="0.55"/>`;
   }).join('');
   svg.innerHTML = paths;
 }
@@ -134,7 +140,7 @@ async function _createEntityAt(x, y) {
     _renderCards(_container?.querySelector('#atlas-canvas-world'));
     _renderEmptyState();
     _scheduleSave();
-    uiModule.showToast('Collection created');
+    toastCollectionCreated();
   } catch (err) {
     uiModule.showError(err.message);
   }
@@ -155,7 +161,7 @@ function _renderEmptyState() {
   el.querySelector('#atlas-empty-world-btn')?.addEventListener('click', async () => {
     if (await _ensureWorld()) {
       await _refresh();
-      uiModule.showToast('World created');
+      toastWorldCreated();
     }
   });
   surface.appendChild(el);
@@ -164,9 +170,10 @@ function _renderEmptyState() {
 function _renderCards(worldEl) {
   if (!worldEl) return;
   worldEl.querySelectorAll('.atlas-canvas-card').forEach(el => el.remove());
-  _nodes.forEach(n => {
+  _nodes.forEach((n, idx) => {
     const card = document.createElement('div');
-    card.className = 'atlas-canvas-card atlas-chrome';
+    card.className = 'atlas-canvas-card atlas-chrome atlas-card-enter';
+    card.style.animationDelay = `${Math.min(idx * 40, 400)}ms`;
     card.dataset.entityId = n.entity_id;
     card.style.cssText = `left:${n.x}px;top:${n.y}px;width:${n.w}px;min-height:${n.h}px`;
     card.innerHTML = `
@@ -178,15 +185,6 @@ function _renderCards(worldEl) {
       <div class="atlas-card-meta">${n.row_count || 0} docs</div>`;
     _wireCardDrag(card, n);
     _wirePortDrag(card, n);
-    card.addEventListener('click', (e) => {
-      if (e.target.closest('.atlas-card-edit') || e.target.closest('.atlas-card-port')) return;
-      if (_onOpenEntity) _onOpenEntity(n.entity_id, n.name);
-    });
-    card.addEventListener('dblclick', (e) => {
-      e.stopPropagation();
-      if (e.target.closest('.atlas-card-edit') || e.target.closest('.atlas-card-port')) return;
-      if (_onOpenEntity) _onOpenEntity(n.entity_id, n.name);
-    });
     card.querySelector('.atlas-card-edit')?.addEventListener('click', async (e) => {
       e.stopPropagation();
       const entity = _entities.find(x => x.id === n.entity_id) || { id: n.entity_id, name: n.name };
@@ -201,7 +199,7 @@ function _renderCards(worldEl) {
         const idx = _entities.findIndex(x => x.id === n.entity_id);
         if (idx >= 0) _entities[idx] = updated;
         card.querySelector('.atlas-card-title').textContent = updated.name;
-        uiModule.showToast('Collection updated');
+        toastCollectionUpdated();
       } catch (err) {
         uiModule.showError(err.message);
       }
@@ -213,10 +211,12 @@ function _renderCards(worldEl) {
 
 function _wireCardDrag(card, node) {
   let dragging = false;
+  let moved = false;
   let sx = 0; let sy = 0; let ox = 0; let oy = 0;
   card.addEventListener('pointerdown', (e) => {
     if (e.target.classList.contains('atlas-card-port') || e.target.closest('.atlas-card-edit')) return;
     dragging = true;
+    moved = false;
     sx = e.clientX; sy = e.clientY;
     ox = node.x; oy = node.y;
     card.setPointerCapture(e.pointerId);
@@ -224,18 +224,43 @@ function _wireCardDrag(card, node) {
   });
   card.addEventListener('pointermove', (e) => {
     if (!dragging) return;
-    node.x = ox + (e.clientX - sx) / _zoom;
-    node.y = oy + (e.clientY - sy) / _zoom;
+    const dx = e.clientX - sx;
+    const dy = e.clientY - sy;
+    if (!moved && Math.hypot(dx, dy) > MOVE_THRESHOLD) {
+      moved = true;
+      card.classList.add('atlas-card-dragging');
+    }
+    if (!moved) return;
+    node.x = ox + dx / _zoom;
+    node.y = oy + dy / _zoom;
     card.style.left = `${node.x}px`;
     card.style.top = `${node.y}px`;
     _renderEdges(_container?.querySelector('#atlas-canvas-svg'));
-    if (_portDrag) _updateDragLine(_portDrag.cursorX, _portDrag.cursorY);
+    if (_portDrag) _updateDragLine(_portDrag.cursorX, _portDrag.cursorY, _portDrag.overValid);
   });
-  card.addEventListener('pointerup', () => {
-    if (dragging) {
-      dragging = false;
+  card.addEventListener('pointerup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    card.classList.remove('atlas-card-dragging');
+    if (moved) {
+      e.preventDefault();
       _scheduleSave();
+      return;
     }
+    if (e.target.closest('.atlas-card-edit') || e.target.closest('.atlas-card-port')) return;
+    card.classList.add('atlas-card-open-flash');
+    setTimeout(() => {
+      card.classList.remove('atlas-card-open-flash');
+      if (_onOpenEntity) {
+        toastBrowsing(node.name);
+        _onOpenEntity(node.entity_id, node.name);
+      }
+    }, 150);
+  });
+  card.addEventListener('pointercancel', () => {
+    dragging = false;
+    moved = false;
+    card.classList.remove('atlas-card-dragging');
   });
 }
 
@@ -251,23 +276,28 @@ function _surfaceToWorld(clientX, clientY) {
 
 function _getDragLineSvg() {
   const world = _container?.querySelector('#atlas-canvas-world');
-  let svg = world?.querySelector('#atlas-canvas-drag-svg');
-  if (!svg && world) {
+  if (!world) return null;
+  let svg = world.querySelector('#atlas-canvas-drag-svg');
+  if (!svg) {
     svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.id = 'atlas-canvas-drag-svg';
     svg.classList.add('atlas-canvas-drag-line');
+    world.appendChild(svg);
+  } else if (svg.parentElement === world && svg !== world.lastElementChild) {
     world.appendChild(svg);
   }
   return svg;
 }
 
-function _updateDragLine(cursorX, cursorY) {
+function _updateDragLine(cursorX, cursorY, overValid = false) {
   if (!_portDrag) return;
   const svg = _getDragLineSvg();
+  if (!svg) return;
   const from = _portPosition(_portDrag.fromEntityId, _portDrag.fromAnchor);
   const mx = (from.x + cursorX) / 2;
   const d = `M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${cursorY}, ${cursorX} ${cursorY}`;
-  svg.innerHTML = `<path d="${d}" stroke="var(--accent)" fill="none" stroke-width="2" stroke-dasharray="6 4" opacity="0.85"/>`;
+  const stroke = overValid ? '#86efac' : 'var(--accent)';
+  svg.innerHTML = `<path d="${d}" stroke="${stroke}" fill="none" stroke-width="2.5" stroke-dasharray="8 5" opacity="0.95"/>`;
 }
 
 function _clearDragLine() {
@@ -284,6 +314,7 @@ function _wirePortDrag(card, node) {
       e.preventDefault();
       const anchor = port.dataset.anchor || 'e';
       const pos = _portPosition(node.entity_id, anchor);
+      port.setPointerCapture(e.pointerId);
       _portDrag = {
         fromEntityId: node.entity_id,
         fromAnchor: anchor,
@@ -292,8 +323,9 @@ function _wirePortDrag(card, node) {
         cursorX: pos.x,
         cursorY: pos.y,
         pointerId: e.pointerId,
+        overValid: false,
       };
-      _updateDragLine(pos.x, pos.y);
+      _updateDragLine(pos.x, pos.y, false);
       document.addEventListener('pointermove', _onPortPointerMove);
       document.addEventListener('pointerup', _onPortPointerUp);
       document.addEventListener('pointercancel', _onPortPointerUp);
@@ -306,18 +338,21 @@ function _onPortPointerMove(e) {
   const w = _surfaceToWorld(e.clientX, e.clientY);
   _portDrag.cursorX = w.x;
   _portDrag.cursorY = w.y;
-  _updateDragLine(w.x, w.y);
   _container?.querySelectorAll('.atlas-port-drop-target').forEach(el => {
     el.classList.remove('atlas-port-drop-target');
   });
   const el = document.elementFromPoint(e.clientX, e.clientY);
   const port = el?.closest?.('.atlas-card-port');
+  let overValid = false;
   if (port) {
     const card = port.closest('.atlas-canvas-card');
     if (card && card.dataset.entityId !== _portDrag.fromEntityId) {
       port.classList.add('atlas-port-drop-target');
+      overValid = true;
     }
   }
+  _portDrag.overValid = overValid;
+  _updateDragLine(w.x, w.y, overValid);
 }
 
 async function _onPortPointerUp(e) {
@@ -347,7 +382,7 @@ async function _onPortPointerUp(e) {
       body: JSON.stringify(data),
     });
     await _refresh();
-    uiModule.showToast('Relationship created');
+    toastConnectionLocked();
   } catch (err) {
     uiModule.showError(err.message);
   }
@@ -409,6 +444,17 @@ async function _refresh() {
   const worldEl = _container?.querySelector('#atlas-canvas-world');
   _renderCards(worldEl);
   _renderEmptyState();
+  if (_portDrag) _updateDragLine(_portDrag.cursorX, _portDrag.cursorY, _portDrag.overValid);
+}
+
+async function _reloadActiveWorlds() {
+  const data = await _fetch('/api/atlas/worlds?archived=false');
+  _worlds = data.worlds || [];
+  if (_worldId && !_worlds.some(w => w.id === _worldId)) {
+    _worldId = _worlds[0]?.id || null;
+    if (_onWorldChange && _worldId) _onWorldChange(_worldId);
+  }
+  _updateWorldSelect();
 }
 
 function _updateWorldSelect() {
@@ -430,7 +476,7 @@ function _wireToolbar() {
       _updateWorldSelect();
       if (_onWorldChange) _onWorldChange(_worldId);
       await _refresh();
-      uiModule.showToast('World created');
+      toastWorldCreated();
     } catch (e) {
       uiModule.showError(e.message);
     }
@@ -442,8 +488,64 @@ function _wireToolbar() {
 
   _container?.querySelector('#atlas-world-select')?.addEventListener('change', async (e) => {
     _worldId = e.target.value;
+    const w = _worlds.find(x => x.id === _worldId);
+    if (w) toastWorldSwitched(w.name);
     if (_onWorldChange) _onWorldChange(_worldId);
     await _refresh();
+  });
+
+  _container?.querySelector('#atlas-worlds-btn')?.addEventListener('click', () => {
+    openWorldsManager({
+      activeWorldId: _worldId,
+      fetchWorlds: async (archived) => {
+        const q = archived ? 'true' : 'false';
+        const data = await _fetch(`/api/atlas/worlds?archived=${q}`);
+        return data.worlds || [];
+      },
+      onSwitch: async (worldId, action, extra = {}) => {
+        try {
+          if (action === 'open') {
+            _worldId = worldId;
+            _updateWorldSelect();
+            if (_onWorldChange) await _onWorldChange(_worldId);
+            await _refresh();
+            const w = _worlds.find(x => x.id === worldId);
+            if (w) toastWorldSwitched(w.name);
+          } else if (action === 'rename') {
+            await _fetch(`/api/atlas/worlds/${worldId}`, {
+              method: 'PUT', body: JSON.stringify({ name: extra.name }),
+            });
+            await _reloadActiveWorlds();
+            toastWorldRenamed(extra.name);
+          } else if (action === 'archive') {
+            await _fetch(`/api/atlas/worlds/${worldId}`, {
+              method: 'PUT', body: JSON.stringify({ archived: true }),
+            });
+            const w = _worlds.find(x => x.id === worldId);
+            await _reloadActiveWorlds();
+            if (_worldId === worldId) await _refresh();
+            toastWorldArchived(w?.name || 'World');
+          } else if (action === 'restore') {
+            await _fetch(`/api/atlas/worlds/${worldId}`, {
+              method: 'PUT', body: JSON.stringify({ archived: false }),
+            });
+            await _reloadActiveWorlds();
+            toastWorldRestored(extra.name || 'World');
+          } else if (action === 'delete') {
+            await _fetch(`/api/atlas/worlds/${worldId}`, { method: 'DELETE' });
+            if (_worldId === worldId) {
+              await _reloadActiveWorlds();
+              await _refresh();
+            } else {
+              await _reloadActiveWorlds();
+            }
+            toastWorldDeleted(extra.name || 'World');
+          }
+        } catch (err) {
+          uiModule.showError(err.message);
+        }
+      },
+    });
   });
 }
 
@@ -463,6 +565,7 @@ export async function mountCanvas(container, {
       <div class="atlas-header atlas-chrome">
         <h2>Atlas</h2>
         <select id="atlas-world-select" class="atlas-world-select atlas-chrome"></select>
+        <button type="button" class="admin-btn-sm" id="atlas-worlds-btn">Worlds…</button>
         <div class="atlas-header-actions">
           <button type="button" class="admin-btn-sm" id="atlas-new-world-btn">+ World</button>
           <button type="button" class="admin-btn-sm" id="atlas-new-entity-btn">+ Collection</button>
