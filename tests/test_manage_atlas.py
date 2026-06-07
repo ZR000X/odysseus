@@ -191,6 +191,35 @@ async def test_owner_isolation(atlas_env):
 
 
 @pytest.mark.asyncio
+async def test_update_entity_name_description(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(
+        atlas_env["owner"], w["id"], "Customers", description="Initial",
+    )
+    updated = atlas_env["entities"].update_entity(
+        atlas_env["owner"], w["id"], e["id"],
+        name="Clients", description="Renamed collection",
+    )
+    assert updated["name"] == "Clients"
+    assert updated["description"] == "Renamed collection"
+
+
+@pytest.mark.asyncio
+async def test_relationship_optional_fields(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+    r = atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many", "", "",
+        from_anchor="e", to_anchor="w",
+    )
+    assert r["from_field"] == ""
+    assert r["to_field"] == ""
+    assert r["from_anchor"] == "e"
+
+
+@pytest.mark.asyncio
 async def test_relationship_crud(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
     a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
@@ -253,3 +282,34 @@ async def test_do_manage_atlas_insert_one(atlas_env, monkeypatch):
     }), owner=atlas_env["owner"])
     assert r3["exit_code"] == 0
     assert r3.get("inserted_id")
+
+
+def test_legacy_world_db_gets_v2_tables(atlas_env):
+    """Opening a pre-v2 world DB adds atlas_fields and related tables."""
+    wdb = sys.modules["services.atlas.world_db"]
+    legacy_path = atlas_env["worlds_dir"] / "legacy.db"
+    conn = sqlite3.connect(legacy_path)
+    conn.executescript("""
+        CREATE TABLE atlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO atlas_meta VALUES ('schema_version', '1');
+        CREATE TABLE atlas_entities (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
+            table_name TEXT NOT NULL UNIQUE, row_count INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+    """)
+    conn.close()
+
+    with wdb.open_world_db(str(legacy_path)) as conn:
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "atlas_fields" in tables
+        assert "atlas_canvas_nodes" in tables
+        assert "atlas_relationships" in tables
+        ver = conn.execute(
+            "SELECT value FROM atlas_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert int(ver) == 2

@@ -31,6 +31,11 @@ class EntityCreate(BaseModel):
     description: str = ""
 
 
+class EntityUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
 class RowBody(BaseModel):
     row: Dict[str, Any]
 
@@ -77,8 +82,8 @@ class RelationshipCreate(BaseModel):
     from_entity_id: str
     to_entity_id: str
     rel_type: str = "one_to_many"
-    from_field: str
-    to_field: str
+    from_field: str = ""
+    to_field: str = ""
     label: str = ""
     from_anchor: str = "right"
     to_anchor: str = "left"
@@ -138,6 +143,17 @@ def setup_atlas_routes() -> APIRouter:
         try:
             return atlas_entities.create_entity(
                 owner, world_id, body.name, description=body.description
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    @router.put("/api/atlas/worlds/{world_id}/entities/{entity_id}")
+    async def update_entity(request: Request, world_id: str, entity_id: str, body: EntityUpdate):
+        owner = _owner(request)
+        try:
+            return atlas_entities.update_entity(
+                owner, world_id, entity_id,
+                name=body.name, description=body.description,
             )
         except Exception as e:
             _handle_err(e)

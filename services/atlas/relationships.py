@@ -66,6 +66,8 @@ def create_relationship(
     rel_type = (rel_type or "one_to_many").lower().replace("-", "_")
     if rel_type not in REL_TYPES:
         raise ValueError(f"rel_type must be one of: {', '.join(sorted(REL_TYPES))}")
+    from_field = from_field or ""
+    to_field = to_field or ""
     rel_id = str(uuid.uuid4())
     now = _utcnow_iso()
     world = get_world(owner, world_id)

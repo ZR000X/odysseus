@@ -81,7 +81,10 @@ function _showCompass(entityId, entityName) {
     worldId: _selectedWorldId,
     entityId,
     entityName,
-    onBack: () => _showCanvas(),
+    onBack: async () => {
+      await _loadEntities();
+      _showCanvas();
+    },
   });
 }
 

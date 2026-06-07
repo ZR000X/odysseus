@@ -79,6 +79,39 @@ def create_entity(
     return get_entity(owner, world_id, entity_id)
 
 
+def update_entity(
+    owner: Optional[str],
+    world_id: str,
+    entity_id: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
+    get_entity(owner, world_id, entity_id)
+    world = get_world(owner, world_id)
+    updates = []
+    params: List[Any] = []
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name.strip() or "Untitled")
+    if description is not None:
+        updates.append("description = ?")
+        params.append(description)
+    if not updates:
+        return get_entity(owner, world_id, entity_id)
+    updates.append("updated_at = ?")
+    params.append(_utcnow_iso())
+    params.append(entity_id)
+    with open_world_db(world["db_path"]) as conn:
+        conn.execute(
+            f"UPDATE atlas_entities SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+    from services.atlas.worlds import refresh_world_stats
+    refresh_world_stats(owner, world_id)
+    return get_entity(owner, world_id, entity_id)
+
+
 def delete_entity(owner: Optional[str], world_id: str, entity_id: str) -> bool:
     entity = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)

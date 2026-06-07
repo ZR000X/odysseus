@@ -3,6 +3,7 @@
  */
 import uiModule from './ui.js';
 import { renderDocumentCard } from './atlas-json-tree.js';
+import { promptAddDocument, promptImportJson } from './atlas-modals.js';
 
 const API_BASE = window.location.origin;
 const PAGE_SIZE = 50;
@@ -30,6 +31,23 @@ async function _fetch(path, opts = {}) {
 
 function _esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function _pickCsvFile() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.csv,text/csv';
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      if (!file) { resolve(null); return; }
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => resolve(null);
+      reader.readAsText(file);
+    });
+    input.click();
+  });
 }
 
 async function _loadSchema(sidebar) {
@@ -115,6 +133,54 @@ function _wire() {
     a.download = `${_entityName.replace(/\s+/g, '_')}.csv`;
     a.click();
   });
+  _container?.querySelector('#atlas-compass-import-csv')?.addEventListener('click', async () => {
+    const csv = await _pickCsvFile();
+    if (!csv) return;
+    try {
+      const stats = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/import`, {
+        method: 'POST',
+        body: JSON.stringify({ mode: 'append', csv }),
+      });
+      uiModule.showToast(`Imported ${stats.rows_inserted || 0} rows (${stats.rows_failed || 0} failed)`);
+      await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+      _page = 0;
+      await _loadDocs();
+    } catch (e) {
+      uiModule.showError(e.message);
+    }
+  });
+  _container?.querySelector('#atlas-compass-import-json')?.addEventListener('click', async () => {
+    const data = await promptImportJson();
+    if (!data?.documents?.length) return;
+    try {
+      const result = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/insertMany`, {
+        method: 'POST',
+        body: JSON.stringify({ documents: data.documents }),
+      });
+      const n = result.inserted_count ?? result.count ?? data.documents.length;
+      uiModule.showToast(`Imported ${n} documents`);
+      await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+      _page = 0;
+      await _loadDocs();
+    } catch (e) {
+      uiModule.showError(e.message);
+    }
+  });
+  _container?.querySelector('#atlas-compass-add-doc')?.addEventListener('click', async () => {
+    const data = await promptAddDocument();
+    if (!data?.document) return;
+    try {
+      await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/insertOne`, {
+        method: 'POST',
+        body: JSON.stringify({ document: data.document }),
+      });
+      uiModule.showToast('Document added');
+      await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+      await _loadDocs();
+    } catch (e) {
+      uiModule.showError(e.message);
+    }
+  });
   _container?.querySelector('#atlas-compass-refresh')?.addEventListener('click', async () => {
     await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
     await _loadDocs();
@@ -135,6 +201,9 @@ export function mountCompass(container, { worldId, entityId, entityName, onBack 
         <button type="button" class="admin-btn-sm" id="atlas-compass-back">← Canvas</button>
         <span class="atlas-compass-title">${_esc(_entityName)}</span>
         <div class="atlas-compass-toolbar-actions">
+          <button type="button" class="admin-btn-sm" id="atlas-compass-add-doc">+ Document</button>
+          <button type="button" class="admin-btn-sm" id="atlas-compass-import-csv">Import CSV</button>
+          <button type="button" class="admin-btn-sm" id="atlas-compass-import-json">Import JSON</button>
           <button type="button" class="admin-btn-sm" id="atlas-compass-export">Export CSV</button>
           <button type="button" class="admin-btn-sm" id="atlas-compass-refresh">Refresh</button>
           <button type="button" class="admin-btn-sm" id="atlas-compass-prev">‹</button>

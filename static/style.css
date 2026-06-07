@@ -4945,7 +4945,8 @@ body.bg-pattern-sparkles {
       #research-overlay,
       #theme-modal,
       #settings-modal,
-      #email-lib-modal {
+      #email-lib-modal,
+      .atlas-modal {
         left: calc(var(--icon-rail-w, 48px) + var(--sidebar-w, 0px));
         width: calc(100% - (var(--icon-rail-w, 48px) + var(--sidebar-w, 0px)));
         box-sizing: border-box;
@@ -36478,7 +36479,9 @@ body.atlas-view { overflow: hidden; }
   top: 0; right: 0; bottom: 0;
   left: var(--sidebar-w, 280px);
   z-index: 201;
-  background: transparent;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   display: flex; flex-direction: column;
 }
 .atlas-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -36505,15 +36508,14 @@ body.atlas-view { overflow: hidden; }
 .atlas-canvas-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .atlas-canvas-surface {
   flex: 1; position: relative; overflow: hidden;
-  background: transparent; cursor: grab;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  cursor: grab;
 }
 .atlas-canvas-surface:active { cursor: grabbing; }
-.atlas-canvas-svg {
+.atlas-canvas-svg,
+.atlas-canvas-drag-line {
   position: absolute; inset: 0; width: 100%; height: 100%;
   pointer-events: none; overflow: visible;
-}
-.atlas-canvas-world {
-  position: absolute; inset: 0; transform-origin: 0 0;
 }
 .atlas-canvas-card {
   position: absolute; border-radius: 8px; padding: 12px 14px;
@@ -36521,17 +36523,50 @@ body.atlas-view { overflow: hidden; }
   transition: box-shadow 0.15s;
 }
 .atlas-canvas-card:hover { box-shadow: 0 6px 28px rgba(0,0,0,0.28); }
-.atlas-card-title { font-weight: 600; font-size: 13px; color: var(--fg); }
+.atlas-card-title { font-weight: 600; font-size: 13px; color: var(--fg); flex: 1; min-width: 0; }
+.atlas-card-header { display: flex; align-items: flex-start; gap: 6px; }
+.atlas-card-edit {
+  flex-shrink: 0; background: transparent; border: none; color: var(--fg);
+  opacity: 0.45; cursor: pointer; padding: 0 2px; font-size: 12px; line-height: 1;
+}
+.atlas-card-edit:hover { opacity: 1; color: var(--accent); }
 .atlas-card-meta { font-size: 10px; opacity: 0.55; margin-top: 4px; }
 .atlas-card-port {
-  position: absolute; width: 8px; height: 8px; border-radius: 50%;
-  background: var(--accent); opacity: 0; transition: opacity 0.15s;
+  position: absolute; width: 14px; height: 14px;
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; transition: opacity 0.15s; cursor: crosshair; z-index: 2;
 }
-.atlas-canvas-card:hover .atlas-card-port { opacity: 0.7; }
-.atlas-card-port-top { top: -4px; left: 50%; transform: translateX(-50%); }
-.atlas-card-port-right { right: -4px; top: 50%; transform: translateY(-50%); }
-.atlas-card-port-bottom { bottom: -4px; left: 50%; transform: translateX(-50%); }
-.atlas-card-port-left { left: -4px; top: 50%; transform: translateY(-50%); }
+.atlas-card-port::after {
+  content: ''; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--panel) 80%, transparent);
+}
+.atlas-canvas-card:hover .atlas-card-port { opacity: 0.85; }
+.atlas-card-port.atlas-port-drop-target::after {
+  background: #86efac; box-shadow: 0 0 0 3px color-mix(in srgb, #86efac 40%, transparent);
+}
+.atlas-card-port-n { top: -7px; left: 50%; transform: translateX(-50%); }
+.atlas-card-port-ne { top: -7px; right: -7px; }
+.atlas-card-port-e { right: -7px; top: 50%; transform: translateY(-50%); }
+.atlas-card-port-se { bottom: -7px; right: -7px; }
+.atlas-card-port-s { bottom: -7px; left: 50%; transform: translateX(-50%); }
+.atlas-card-port-sw { bottom: -7px; left: -7px; }
+.atlas-card-port-w { left: -7px; top: 50%; transform: translateY(-50%); }
+.atlas-card-port-nw { top: -7px; left: -7px; }
+.atlas-canvas-world {
+  position: absolute; inset: 0; transform-origin: 0 0;
+}
+.atlas-canvas-drag-line {
+  z-index: 5;
+}
+.atlas-canvas-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  pointer-events: none; z-index: 3;
+}
+.atlas-canvas-empty-inner {
+  pointer-events: auto; text-align: center; padding: 24px 32px;
+  border-radius: 10px; max-width: 320px;
+}
+.atlas-canvas-empty-inner p { margin: 0 0 12px; font-size: 13px; opacity: 0.65; }
 .atlas-canvas-hint {
   font-size: 10px; opacity: 0.5; padding: 6px 12px; text-align: center;
   flex-shrink: 0; border-top: none;

@@ -91,18 +91,29 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
+def ensure_world_schema(conn: sqlite3.Connection) -> int:
+    """Apply additive schema updates idempotently (v1 worlds → v2 tables)."""
+    conn.executescript(_WORLD_BOOTSTRAP_SQL)
+    row = conn.execute(
+        "SELECT value FROM atlas_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    current = int(row[0]) if row else 1
+    if current < SCHEMA_VERSION:
+        conn.execute(
+            "INSERT OR REPLACE INTO atlas_meta (key, value) VALUES (?, ?)",
+            ("schema_version", str(SCHEMA_VERSION)),
+        )
+    return SCHEMA_VERSION
+
+
 def bootstrap_world_db(world_id: str, db_path: Optional[str] = None) -> str:
     path = db_path or world_db_path(world_id)
     ensure_atlas_dir()
     conn = sqlite3.connect(path)
     try:
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_WORLD_BOOTSTRAP_SQL)
+        ensure_world_schema(conn)
         now = _utcnow_iso()
-        conn.execute(
-            "INSERT OR REPLACE INTO atlas_meta (key, value) VALUES (?, ?)",
-            ("schema_version", str(SCHEMA_VERSION)),
-        )
         conn.execute(
             "INSERT OR REPLACE INTO atlas_meta (key, value) VALUES (?, ?)",
             ("world_id", json.dumps(world_id)),
@@ -124,6 +135,7 @@ def open_world_db(db_path: str) -> Iterator[sqlite3.Connection]:
     try:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
+        ensure_world_schema(conn)
         yield conn
         conn.commit()
     except Exception:
