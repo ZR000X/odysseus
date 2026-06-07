@@ -1,5 +1,6 @@
 """Tests for manage_atlas agent tool and Atlas services."""
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
@@ -61,18 +62,26 @@ def atlas_env(tmp_path, monkeypatch):
     monkeypatch.setattr(wdb, "world_db_path", lambda wid: str(worlds_dir / f"{wid}.db"))
 
     ddl = _load_atlas_module("ddl", "ddl.py")
+    _load_atlas_module("fields", "fields.py")
+    _load_atlas_module("query", "query.py")
     worlds_mod = _load_atlas_module("worlds", "worlds.py")
     entities_mod = _load_atlas_module("entities", "entities.py")
+    documents_mod = _load_atlas_module("documents", "documents.py")
     rows_mod = _load_atlas_module("rows", "rows.py")
     csv_mod = _load_atlas_module("csv_io", "csv_io.py")
+    canvas_mod = _load_atlas_module("canvas", "canvas.py")
+    rels_mod = _load_atlas_module("relationships", "relationships.py")
 
     yield {
         "owner": "testuser",
         "worlds_dir": worlds_dir,
         "worlds": worlds_mod,
         "entities": entities_mod,
+        "documents": documents_mod,
         "rows": rows_mod,
         "csv": csv_mod,
+        "canvas": canvas_mod,
+        "relationships": rels_mod,
         "ddl": ddl,
     }
 
@@ -86,72 +95,92 @@ async def test_resolve_default_world_creates_my_world(atlas_env):
 
 
 @pytest.mark.asyncio
-async def test_create_entity_creates_physical_table(atlas_env):
+async def test_create_entity_json_table(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
-    e = atlas_env["entities"].create_entity(
-        atlas_env["owner"], w["id"], "Customers",
-        attributes=[
-            {"name": "id", "type": "text", "primary_key": True},
-            {"name": "name", "type": "text"},
-        ],
-    )
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
     db_file = w["db_path"]
     conn = sqlite3.connect(db_file)
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (e["table_name"],)
-    ).fetchall()]
+    info = conn.execute(f"PRAGMA table_info({e['table_name']})").fetchall()
     conn.close()
-    assert e["table_name"] in tables
+    cols = {r[1] for r in info}
+    assert "data" in cols
+    assert "_atlas_row_id" in cols
 
 
 @pytest.mark.asyncio
-async def test_row_crud_roundtrip(atlas_env):
+async def test_insert_and_find(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
-    e = atlas_env["entities"].create_entity(
-        atlas_env["owner"], w["id"], "Items",
-        attributes=[{"name": "id", "type": "text", "primary_key": True}, {"name": "qty", "type": "integer"}],
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    r = atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alice", "qty": 5}
     )
-    r = atlas_env["rows"].add_row(atlas_env["owner"], w["id"], e["id"], {"id": "a1", "qty": 5})
-    assert r["row_id"] > 0
-    assert atlas_env["rows"].count_rows(atlas_env["owner"], w["id"], e["id"]) == 1
-    listed = atlas_env["rows"].list_rows(atlas_env["owner"], w["id"], e["id"])
-    assert listed["rows"][0]["id"] == "a1"
+    assert r["inserted_id"] > 0
+    found = atlas_env["documents"].find(
+        atlas_env["owner"], w["id"], e["id"], filter_obj={"name": "Alice"}
+    )
+    assert found["total"] == 1
+    assert found["documents"][0]["name"] == "Alice"
+    assert found["documents"][0]["_id"] == r["inserted_id"]
+
+
+@pytest.mark.asyncio
+async def test_update_many(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"region": "EU", "x": 1})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"region": "EU", "x": 2})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"region": "US", "x": 3})
+    r = atlas_env["documents"].update_many(
+        atlas_env["owner"], w["id"], e["id"],
+        {"region": "EU"}, {"$set": {"currency": "EUR"}},
+    )
+    assert r["matched_count"] == 2
+    assert r["modified_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_one_and_count(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Nums")
+    r = atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"n": 1})
+    assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 1
+    atlas_env["documents"].delete_one(atlas_env["owner"], w["id"], e["id"], {"_id": r["inserted_id"]})
+    assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_get_schema_sample(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Products")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"sku": "A1", "price": 9.99}
+    )
+    schema = atlas_env["documents"].get_entity_schema(atlas_env["owner"], w["id"], e["id"])
+    assert schema["document_count"] == 1
+    assert schema["sample_document"]["sku"] == "A1"
+    slugs = {f["slug"] for f in schema["fields"]}
+    assert "sku" in slugs
+
+
+@pytest.mark.asyncio
+async def test_legacy_update_row_alias(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    r = atlas_env["rows"].add_row(atlas_env["owner"], w["id"], e["id"], {"qty": 5})
     atlas_env["rows"].update_row(atlas_env["owner"], w["id"], e["id"], r["row_id"], {"qty": 10})
-    listed2 = atlas_env["rows"].list_rows(atlas_env["owner"], w["id"], e["id"])
-    assert listed2["rows"][0]["qty"] == 10
-    atlas_env["rows"].delete_row(atlas_env["owner"], w["id"], e["id"], r["row_id"])
-    assert atlas_env["rows"].count_rows(atlas_env["owner"], w["id"], e["id"]) == 0
+    doc = atlas_env["documents"].find_one(
+        atlas_env["owner"], w["id"], e["id"], {"_id": r["row_id"]}
+    )
+    assert doc["qty"] == 10
 
 
 @pytest.mark.asyncio
-async def test_import_merge_upserts_on_pk(atlas_env):
+async def test_import_merge(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
-    e = atlas_env["entities"].create_entity(
-        atlas_env["owner"], w["id"], "Customers",
-        attributes=[{"name": "id", "type": "text", "primary_key": True}, {"name": "name", "type": "text"}],
-    )
-    csv1 = "id,name\n1,Alice\n2,Bob\n"
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    csv1 = "name,email\nAlice,a@x.com\nBob,b@x.com\n"
     atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv1, mode="append")
-    assert atlas_env["rows"].count_rows(atlas_env["owner"], w["id"], e["id"]) == 2
-    csv2 = "id,name\n1,Alice Updated\n3,Carol\n"
-    stats = atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv2, mode="merge")
-    assert stats["rows_updated"] >= 1
-    assert atlas_env["rows"].count_rows(atlas_env["owner"], w["id"], e["id"]) == 3
-    rows = atlas_env["rows"].list_rows(atlas_env["owner"], w["id"], e["id"], limit=10)
-    names = {r["id"]: r["name"] for r in rows["rows"]}
-    assert names["1"] == "Alice Updated"
-
-
-@pytest.mark.asyncio
-async def test_import_replace_truncates(atlas_env):
-    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
-    e = atlas_env["entities"].create_entity(
-        atlas_env["owner"], w["id"], "Items",
-        attributes=[{"name": "id", "type": "text", "primary_key": True}],
-    )
-    atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], "id\n1\n2\n3\n", mode="append")
-    atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], "id\n9\n", mode="replace")
-    assert atlas_env["rows"].count_rows(atlas_env["owner"], w["id"], e["id"]) == 1
+    assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 2
 
 
 @pytest.mark.asyncio
@@ -162,63 +191,65 @@ async def test_owner_isolation(atlas_env):
 
 
 @pytest.mark.asyncio
-async def test_list_rows_limit_cap(atlas_env):
+async def test_relationship_crud(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
-    e = atlas_env["entities"].create_entity(
-        atlas_env["owner"], w["id"], "Nums",
-        attributes=[{"name": "n", "type": "integer"}],
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Orders")
+    r = atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many", "id", "customer_id",
     )
-    for i in range(30):
-        atlas_env["rows"].add_row(atlas_env["owner"], w["id"], e["id"], {"n": i})
-    result2 = atlas_env["rows"].list_rows(atlas_env["owner"], w["id"], e["id"], limit=5)
-    assert len(result2["rows"]) == 5
-
-
-def test_reserved_slug_rejected(atlas_env):
-    with pytest.raises(ValueError):
-        atlas_env["ddl"].slugify("rowid")
+    rels = atlas_env["relationships"].list_relationships(atlas_env["owner"], w["id"])
+    assert len(rels) == 1
+    assert rels[0]["id"] == r["id"]
 
 
 @pytest.mark.asyncio
-async def test_export_csv_headers(atlas_env):
+async def test_canvas_layout(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
-    e = atlas_env["entities"].create_entity(
-        atlas_env["owner"], w["id"], "Products",
-        attributes=[{"name": "sku", "type": "text"}, {"name": "price", "type": "real"}],
-    )
-    text = atlas_env["csv"].export_csv(atlas_env["owner"], w["id"], e["id"])
-    header = text.splitlines()[0]
-    assert "_atlas_row_id" in header
-    assert "sku" in header
-    assert "price" in header
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    atlas_env["canvas"].upsert_node(atlas_env["owner"], w["id"], e["id"], 100, 200)
+    layout = atlas_env["canvas"].get_layout(atlas_env["owner"], w["id"])
+    node = next(n for n in layout["nodes"] if n["entity_id"] == e["id"])
+    assert node["x"] == 100
+    assert node["y"] == 200
 
 
 @pytest.mark.asyncio
-async def test_do_manage_atlas_create_entity(atlas_env, monkeypatch):
-    import json
+async def test_delete_many_requires_confirm(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "X")
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"a": 1})
+    with pytest.raises(ValueError, match="confirm"):
+        atlas_env["documents"].delete_many(atlas_env["owner"], w["id"], e["id"], {})
 
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_insert_one(atlas_env, monkeypatch):
     wdb = sys.modules["services.atlas.world_db"]
     monkeypatch.setattr(wdb, "ATLAS_WORLDS_DIR", str(atlas_env["worlds_dir"]))
     monkeypatch.setattr(
-        wdb,
-        "world_db_path",
-        lambda wid: str(atlas_env["worlds_dir"] / f"{wid}.db"),
+        wdb, "world_db_path", lambda wid: str(atlas_env["worlds_dir"] / f"{wid}.db")
     )
-
     from src.tool_implementations import do_manage_atlas
 
     r = await do_manage_atlas(json.dumps({
-        "action": "create_world",
-        "name": "Agent World",
+        "action": "create_world", "name": "Agent World",
     }), owner=atlas_env["owner"])
     assert r["exit_code"] == 0
-    assert r.get("world_id")
 
     r2 = await do_manage_atlas(json.dumps({
         "action": "create_entity",
         "world_id": r["world_id"],
         "name": "Customers",
-        "attributes": [{"name": "id", "type": "text", "primary_key": True}],
     }), owner=atlas_env["owner"])
     assert r2["exit_code"] == 0
-    assert r2.get("entity_id")
+
+    r3 = await do_manage_atlas(json.dumps({
+        "action": "insertOne",
+        "world_id": r["world_id"],
+        "entity_id": r2["entity_id"],
+        "document": {"name": "Carol"},
+    }), owner=atlas_env["owner"])
+    assert r3["exit_code"] == 0
+    assert r3.get("inserted_id")

@@ -3,28 +3,34 @@ from __future__ import annotations
 
 import csv
 import io
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, Optional
 
+from services.atlas import documents as atlas_documents
 from services.atlas.entities import get_entity
-from services.atlas.rows import add_row, update_row
 from services.atlas.world_db import open_world_db
 from services.atlas.worlds import get_world, refresh_world_stats
 
 
 def export_csv(owner: Optional[str], world_id: str, entity_id: str) -> str:
     entity = get_entity(owner, world_id, entity_id)
-    world = get_world(owner, world_id)
-    table = entity["table_name"]
-    slugs = ["_atlas_row_id"] + [a["slug"] for a in entity["attributes"]]
-    col_list = ", ".join('"' + s.replace('"', '""') + '"' for s in slugs)
+    result = atlas_documents.find(owner, world_id, entity_id, limit=10000, offset=0)
+    docs = result["documents"]
+    all_keys: set = set()
+    for d in docs:
+        all_keys.update(k for k in d if not k.startswith("_") or k == "_atlas_row_id")
+    slugs = ["_atlas_row_id"] + sorted(k for k in all_keys if k != "_atlas_row_id")
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
     writer.writerow(slugs)
-    with open_world_db(world["db_path"]) as conn:
-        for row in conn.execute(
-            f'SELECT {col_list} FROM "{table}" ORDER BY _atlas_row_id'
-        ).fetchall():
-            writer.writerow([row[s] if row[s] is not None else "" for s in slugs])
+    for d in docs:
+        row = []
+        for s in slugs:
+            v = d.get(s, d.get("_id") if s == "_atlas_row_id" else "")
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            row.append("" if v is None else str(v))
+        writer.writerow(row)
     return buf.getvalue()
 
 
@@ -41,8 +47,6 @@ def import_rows(
     entity = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)
     table = entity["table_name"]
-    slugs = {a["slug"] for a in entity["attributes"]}
-    pk_attr = next((a for a in entity["attributes"] if a["is_primary_key"]), None)
 
     reader = csv.DictReader(io.StringIO(csv_text))
     if not reader.fieldnames:
@@ -67,29 +71,21 @@ def import_rows(
 
     for i, raw in enumerate(reader):
         stats["rows_total"] += 1
-        row_data = {k: v for k, v in raw.items() if k and k in slugs}
-        row_id_raw = raw.get("_atlas_row_id", "").strip()
+        row_data = {
+            k: v for k, v in raw.items()
+            if k and k not in ("_atlas_row_id", "_id")
+        }
+        row_id_raw = (raw.get("_atlas_row_id") or raw.get("_id") or "").strip()
         try:
             if mode == "merge" and row_id_raw.isdigit():
-                update_row(owner, world_id, entity_id, int(row_id_raw), row_data)
+                atlas_documents.update_one(
+                    owner, world_id, entity_id,
+                    {"_id": int(row_id_raw)}, row_data,
+                )
                 stats["rows_updated"] += 1
                 continue
-            if mode == "merge" and pk_attr and pk_attr["slug"] in raw and raw[pk_attr["slug"]]:
-                # upsert by PK
-                pk_val = raw[pk_attr["slug"]]
-                from services.atlas.rows import list_rows
-                existing = list_rows(
-                    owner, world_id, entity_id,
-                    limit=1, offset=0,
-                    filter_col=pk_attr["slug"], filter_val=pk_val,
-                )
-                if existing["rows"]:
-                    rid = existing["rows"][0]["_atlas_row_id"]
-                    update_row(owner, world_id, entity_id, rid, row_data)
-                    stats["rows_updated"] += 1
-                    continue
-            if row_data:
-                add_row(owner, world_id, entity_id, row_data)
+            if row_data or mode == "append":
+                atlas_documents.insert_one(owner, world_id, entity_id, row_data)
                 stats["rows_inserted"] += 1
             else:
                 stats["rows_skipped"] += 1

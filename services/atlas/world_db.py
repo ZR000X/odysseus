@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 ATLAS_WORLDS_DIR = os.path.join("data", "atlas", "worlds")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _WORLD_BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS atlas_meta (
@@ -27,27 +27,53 @@ CREATE TABLE IF NOT EXISTS atlas_entities (
     updated_at      DATETIME NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS atlas_attributes (
+CREATE TABLE IF NOT EXISTS atlas_fields (
     id              TEXT PRIMARY KEY,
     entity_id       TEXT NOT NULL,
-    name            TEXT NOT NULL,
     slug            TEXT NOT NULL,
-    attr_type       TEXT NOT NULL,
-    nullable        INTEGER NOT NULL DEFAULT 1,
-    is_primary_key  INTEGER NOT NULL DEFAULT 0,
-    is_unique       INTEGER NOT NULL DEFAULT 0,
-    sort_order      INTEGER NOT NULL DEFAULT 0,
+    inferred_type   TEXT NOT NULL DEFAULT 'text',
+    occurrence_count INTEGER NOT NULL DEFAULT 0,
+    nullable_ratio  REAL NOT NULL DEFAULT 1.0,
     created_at      DATETIME NOT NULL,
     updated_at      DATETIME NOT NULL,
     FOREIGN KEY (entity_id) REFERENCES atlas_entities(id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_atlas_attributes_entity_slug
-    ON atlas_attributes (entity_id, slug);
-CREATE INDEX IF NOT EXISTS ix_atlas_attributes_entity_order
-    ON atlas_attributes (entity_id, sort_order);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_atlas_fields_entity_slug
+    ON atlas_fields (entity_id, slug);
 CREATE INDEX IF NOT EXISTS ix_atlas_entities_name
     ON atlas_entities (name);
+
+CREATE TABLE IF NOT EXISTS atlas_canvas_nodes (
+    entity_id   TEXT PRIMARY KEY,
+    x           REAL NOT NULL DEFAULT 0,
+    y           REAL NOT NULL DEFAULT 0,
+    w           REAL NOT NULL DEFAULT 200,
+    h           REAL NOT NULL DEFAULT 120,
+    z_index     INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (entity_id) REFERENCES atlas_entities(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS atlas_relationships (
+    id              TEXT PRIMARY KEY,
+    from_entity_id  TEXT NOT NULL,
+    to_entity_id    TEXT NOT NULL,
+    rel_type        TEXT NOT NULL,
+    from_field      TEXT NOT NULL,
+    to_field        TEXT NOT NULL,
+    label           TEXT DEFAULT '',
+    from_anchor     TEXT DEFAULT 'right',
+    to_anchor       TEXT DEFAULT 'left',
+    created_at      DATETIME NOT NULL,
+    updated_at      DATETIME NOT NULL,
+    FOREIGN KEY (from_entity_id) REFERENCES atlas_entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (to_entity_id) REFERENCES atlas_entities(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_atlas_relationships_from
+    ON atlas_relationships (from_entity_id);
+CREATE INDEX IF NOT EXISTS ix_atlas_relationships_to
+    ON atlas_relationships (to_entity_id);
 """
 
 

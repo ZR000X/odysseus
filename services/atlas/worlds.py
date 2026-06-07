@@ -76,7 +76,7 @@ def create_world(owner: Optional[str], name: str, description: str = "") -> Dict
             db_path=db_path,
             entity_count=0,
             row_count=0,
-            schema_version=1,
+            schema_version=2,
         )
         db.add(w)
         db.commit()

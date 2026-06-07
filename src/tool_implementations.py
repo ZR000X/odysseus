@@ -2043,11 +2043,13 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
 # ---------------------------------------------------------------------------
 
 async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
-    """Handle manage_atlas tool calls: worlds, entities, rows, CSV import."""
+    """Handle manage_atlas tool calls: MongoDB-style document store."""
+    import json as _json
     from services.atlas import worlds as atlas_worlds
     from services.atlas import entities as atlas_entities
-    from services.atlas import rows as atlas_rows
+    from services.atlas import documents as atlas_documents
     from services.atlas import csv_io as atlas_csv
+    from services.atlas import relationships as atlas_relationships
     from services.atlas.worlds import AtlasNotFoundError, AtlasAccessError
 
     try:
@@ -2056,16 +2058,40 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
         return {"error": "Invalid JSON arguments", "exit_code": 1}
 
     action = (args.get("action") or "").replace("-", "_").strip().lower()
-    _ALIASES = {"create": "create_world", "query": "list_rows", "import": "import_rows", "export": "export_csv"}
+    _ALIASES = {
+        "create": "create_world",
+        "query": "find",
+        "query_rows": "find",
+        "list_rows": "find",
+        "count_rows": "countdocuments",
+        "add_row": "insertone",
+        "update_row": "updateone",
+        "delete_row": "deleteone",
+        "import": "import_rows",
+        "export": "export_csv",
+        "get_schema": "get_schema",
+        "describe": "describe_collection",
+    }
     if action in ("create_entity", "new_entity"):
         action = "create_entity"
     elif action == "create" and args.get("entity_id"):
-        action = "add_row"
-    elif action == "create" and (args.get("attributes") or args.get("entity_name")):
+        action = "insertone"
+    elif action == "create" and (args.get("entity_name") or args.get("name")):
         action = "create_entity"
     elif action == "create":
         action = "create_world"
     action = _ALIASES.get(action, action)
+    # normalize camelCase MongoDB names
+    _CAMEL = {
+        "findone": "findone", "countdocuments": "countdocuments",
+        "insertone": "insertone", "insertmany": "insertmany",
+        "updateone": "updateone", "updatemany": "updatemany",
+        "replaceone": "replaceone", "deleteone": "deleteone",
+        "deletemany": "deletemany", "describe_collection": "describe_collection",
+        "list_relationships": "list_relationships",
+        "create_relationship": "create_relationship",
+    }
+    action = _CAMEL.get(action, action)
 
     def _resolve_world_id() -> str:
         wid = args.get("world_id")
@@ -2115,93 +2141,171 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
                 return {"response": "No entities in this world.", "exit_code": 0}
             lines = []
             for e in entities:
-                attrs = ", ".join(a["name"] for a in e["attributes"]) or "(no columns)"
-                lines.append(f"- [{e['id'][:8]}] **{e['name']}** ({e['row_count']} rows) — {attrs}")
+                fields = ", ".join(f["slug"] for f in e.get("fields", [])) or "(schemaless)"
+                lines.append(f"- [{e['id'][:8]}] **{e['name']}** ({e['row_count']} docs) — {fields}")
             return {"results": "\n".join(lines), "world_id": world_id, "exit_code": 0}
 
         if action == "create_entity":
-            attrs = args.get("attributes") or []
-            if isinstance(attrs, dict):
-                attrs = [{"name": k, "type": v} for k, v in attrs.items()]
             e = atlas_entities.create_entity(
                 owner, world_id,
                 args.get("name") or args.get("entity_name") or "Untitled",
-                attributes=attrs,
                 description=args.get("description") or "",
             )
             return {
-                "response": f"Created entity \"{e['name']}\" (id: {e['id'][:8]})",
+                "response": f"Created collection \"{e['name']}\" (id: {e['id'][:8]})",
                 "world_id": world_id,
                 "entity_id": e["id"],
                 "entity_name": e["name"],
                 "exit_code": 0,
             }
 
-        if action == "add_attribute":
-            entity_id = _resolve_entity_id(world_id)
-            e = atlas_entities.add_attribute(
-                owner, world_id, entity_id,
-                args.get("name") or args.get("attribute_name") or "",
-                attr_type=args.get("type") or args.get("attr_type") or "text",
-                nullable=args.get("nullable", True),
-                is_primary_key=bool(args.get("primary_key") or args.get("is_primary_key")),
-                is_unique=bool(args.get("unique") or args.get("is_unique")),
-            )
-            return {"response": f"Added attribute to {e['name']}", "entity_id": entity_id, "exit_code": 0}
-
         entity_id = _resolve_entity_id(world_id)
 
-        if action == "list_rows":
+        def _filter_obj():
+            f = args.get("filter")
+            if isinstance(f, dict):
+                return f
+            if args.get("filter_col") and args.get("filter_val") is not None:
+                col = args["filter_col"]
+                if col in ("_id", "_atlas_row_id"):
+                    return {"_id": int(args["filter_val"])}
+                return {col: args["filter_val"]}
+            if args.get("row_id") or args.get("_id"):
+                return {"_id": int(args.get("row_id") or args.get("_id"))}
+            return {}
+
+        if action in ("get_schema", "describe_collection"):
+            schema = atlas_documents.get_entity_schema(owner, world_id, entity_id)
+            lines = [
+                f"**{schema['entity_name']}** — {schema['document_count']} documents",
+                "Fields: " + (", ".join(
+                    f"{f['slug']} ({f['inferred_type']})" for f in schema.get("fields", [])
+                ) or "(none yet)"),
+            ]
+            if schema.get("sample_document"):
+                lines.append("Sample:\n```json\n" + _json.dumps(schema["sample_document"], indent=2) + "\n```")
+            return {"results": "\n".join(lines), "schema": schema, "exit_code": 0}
+
+        if action == "find":
             limit = min(int(args.get("limit") or 20), 100)
             offset = int(args.get("offset") or 0)
-            result = atlas_rows.list_rows(
+            result = atlas_documents.find(
                 owner, world_id, entity_id,
+                filter_obj=_filter_obj() or None,
                 limit=limit, offset=offset,
-                filter_col=args.get("filter_col") or args.get("column"),
-                filter_val=args.get("filter_val") or args.get("filter"),
+                sort=args.get("sort"),
             )
             entity = atlas_entities.get_entity(owner, world_id, entity_id)
-            if not result["rows"]:
-                return {"response": f"No rows in {entity['name']} (total: {result['total']}).", "exit_code": 0}
-            cols = ["_atlas_row_id"] + [a["slug"] for a in entity["attributes"]]
-            lines = [f"Showing {len(result['rows'])} of {result['total']} rows in **{entity['name']}**:"]
-            for r in result["rows"]:
-                parts = [f"{c}={r.get(c, '')}" for c in cols]
-                lines.append(f"- [{r['_atlas_row_id']}] " + ", ".join(parts))
+            if not result["documents"]:
+                return {"response": f"No documents in {entity['name']} (total: {result['total']}).", "exit_code": 0}
+            lines = [f"Showing {len(result['documents'])} of {result['total']} in **{entity['name']}**:"]
+            for d in result["documents"]:
+                lines.append("```json\n" + _json.dumps(d, indent=2) + "\n```")
             return {"results": _truncate("\n".join(lines)), "exit_code": 0}
 
-        if action == "count_rows":
-            n = atlas_rows.count_rows(owner, world_id, entity_id)
-            entity = atlas_entities.get_entity(owner, world_id, entity_id)
-            return {"response": f"{entity['name']}: {n} rows", "count": n, "exit_code": 0}
+        if action == "findone":
+            doc = atlas_documents.find_one(owner, world_id, entity_id, _filter_obj() or None)
+            if not doc:
+                return {"response": "No matching document.", "exit_code": 0}
+            return {"results": "```json\n" + _json.dumps(doc, indent=2) + "\n```", "document": doc, "exit_code": 0}
 
-        if action == "add_row":
-            row = args.get("row") or args.get("data") or {}
-            if not row:
-                row = {k: v for k, v in args.items() if k not in (
-                    "action", "world_id", "entity_id", "entity_name", "owner")}
-            r = atlas_rows.add_row(owner, world_id, entity_id, row)
+        if action == "countdocuments":
+            n = atlas_documents.count_documents(owner, world_id, entity_id, _filter_obj() or None)
+            entity = atlas_entities.get_entity(owner, world_id, entity_id)
+            return {"response": f"{entity['name']}: {n} documents", "count": n, "exit_code": 0}
+
+        if action == "insertone":
+            doc = args.get("document") or args.get("row") or args.get("data") or {}
+            if not doc:
+                doc = {k: v for k, v in args.items() if k not in (
+                    "action", "world_id", "entity_id", "entity_name", "owner", "filter", "update")}
+            r = atlas_documents.insert_one(owner, world_id, entity_id, doc)
             return {
-                "response": f"Added row {r['row_id']}",
-                "row_id": r["row_id"],
+                "response": f"Inserted document _id={r['inserted_id']}",
+                "inserted_id": r["inserted_id"],
+                "row_id": r["inserted_id"],
                 "entity_id": entity_id,
                 "world_id": world_id,
                 "exit_code": 0,
             }
 
-        if action == "update_row":
-            row_id = int(args.get("row_id") or args.get("_atlas_row_id"))
-            row = args.get("row") or args.get("data") or {}
-            if not row:
-                row = {k: v for k, v in args.items() if k not in (
-                    "action", "world_id", "entity_id", "row_id", "_atlas_row_id")}
-            r = atlas_rows.update_row(owner, world_id, entity_id, row_id, row)
-            return {"response": f"Updated row {row_id}", "row_id": row_id, "exit_code": 0}
+        if action == "insertmany":
+            docs = args.get("documents") or args.get("rows") or []
+            r = atlas_documents.insert_many(owner, world_id, entity_id, docs)
+            return {
+                "response": f"Inserted {r['inserted_count']} documents",
+                "inserted_ids": r["inserted_ids"],
+                "exit_code": 0,
+            }
 
-        if action == "delete_row":
-            row_id = int(args.get("row_id") or args.get("_atlas_row_id"))
-            atlas_rows.delete_row(owner, world_id, entity_id, row_id)
-            return {"response": f"Deleted row {row_id}", "exit_code": 0}
+        if action == "updateone":
+            filt = _filter_obj() or None
+            if not filt and (args.get("row_id") or args.get("_id")):
+                filt = {"_id": int(args.get("row_id") or args.get("_id"))}
+            upd = args.get("update") or args.get("row") or args.get("data") or {}
+            if not upd:
+                upd = {k: v for k, v in args.items() if k not in (
+                    "action", "world_id", "entity_id", "filter", "row_id", "_id", "upsert", "confirm")}
+            r = atlas_documents.update_one(
+                owner, world_id, entity_id, filt, upd,
+                upsert=bool(args.get("upsert")),
+            )
+            return {
+                "response": f"matched={r.get('matched_count', 0)} modified={r.get('modified_count', 0)}",
+                **r, "exit_code": 0,
+            }
+
+        if action == "updatemany":
+            upd = args.get("update") or {}
+            r = atlas_documents.update_many(
+                owner, world_id, entity_id, _filter_obj() or None, upd,
+            )
+            return {
+                "response": f"matched={r['matched_count']} modified={r['modified_count']}",
+                **r, "exit_code": 0,
+            }
+
+        if action == "replaceone":
+            r = atlas_documents.replace_one(
+                owner, world_id, entity_id,
+                _filter_obj() or None,
+                args.get("replacement") or args.get("document") or {},
+                upsert=bool(args.get("upsert")),
+            )
+            return {"response": f"matched={r.get('matched_count', 0)}", **r, "exit_code": 0}
+
+        if action == "deleteone":
+            r = atlas_documents.delete_one(owner, world_id, entity_id, _filter_obj() or None)
+            return {"response": f"deleted={r['deleted_count']}", **r, "exit_code": 0}
+
+        if action == "deletemany":
+            r = atlas_documents.delete_many(
+                owner, world_id, entity_id,
+                _filter_obj() or None,
+                confirm=bool(args.get("confirm")),
+            )
+            return {"response": f"deleted={r['deleted_count']}", **r, "exit_code": 0}
+
+        if action == "list_relationships":
+            rels = atlas_relationships.list_relationships(owner, world_id)
+            if not rels:
+                return {"response": "No relationships defined.", "exit_code": 0}
+            lines = [
+                f"- {r['rel_type']}: {r['from_entity_id'][:8]}.{r['from_field']} → "
+                f"{r['to_entity_id'][:8]}.{r['to_field']}"
+                for r in rels
+            ]
+            return {"results": "\n".join(lines), "exit_code": 0}
+
+        if action == "create_relationship":
+            r = atlas_relationships.create_relationship(
+                owner, world_id,
+                args["from_entity_id"], args["to_entity_id"],
+                args.get("rel_type") or "one_to_many",
+                args["from_field"], args["to_field"],
+                label=args.get("label") or "",
+            )
+            return {"response": f"Created relationship {r['id'][:8]}", "relationship_id": r["id"], "exit_code": 0}
 
         if action == "import_rows":
             csv_text = args.get("csv") or args.get("csv_text") or args.get("content") or ""
