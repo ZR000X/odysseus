@@ -1509,6 +1509,22 @@ class Integration(TimestampMixin, Base):
     enabled = Column(Boolean, default=True)
 
 
+class AtlasWorld(TimestampMixin, Base):
+    """Registry row for an Atlas data world (per-world SQLite file on disk)."""
+    __tablename__ = "atlas_worlds"
+
+    id = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    db_path = Column(String, nullable=False)
+    entity_count = Column(Integer, default=0, nullable=False)
+    row_count = Column(Integer, default=0, nullable=False)
+    schema_version = Column(Integer, default=1, nullable=False)
+
+    __table_args__ = (
+        Index("ix_atlas_worlds_owner_updated", "owner", "updated_at"),
+    )
 
 
 
@@ -1632,6 +1648,7 @@ def init_db():
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
     _migrate_backfill_task_folders()
+    _migrate_add_atlas_worlds_table()
 
 
 def _migrate_backfill_task_folders():
@@ -1725,6 +1742,25 @@ def _migrate_chat_messages_fts():
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_add_atlas_worlds_table():
+    """Ensure atlas_worlds registry table exists (idempotent via create_all + index)."""
+    try:
+        with engine.connect() as conn:
+            tables = [r[0] for r in conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='atlas_worlds'"
+            ))]
+            if "atlas_worlds" not in tables:
+                Base.metadata.tables["atlas_worlds"].create(bind=engine, checkfirst=True)
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_atlas_worlds_owner_updated "
+                "ON atlas_worlds (owner, updated_at)"
+            ))
+            conn.commit()
+            logging.getLogger(__name__).info("Atlas worlds registry table ready")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"atlas_worlds migration: {e}")
 
 
 def _migrate_add_email_smtp_security():

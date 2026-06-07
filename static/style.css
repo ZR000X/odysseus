@@ -36389,6 +36389,7 @@ body.theme-frosted .modal {
   0%   { box-shadow: 0 0 0 2px var(--accent, var(--red)); }
   100% { box-shadow: 0 0 0 2px transparent; }
 }
+}
 /* ── ask_user: multiple-choice question card ─────────────────────────────
    The agent posed a question and ended its turn. The user clicks an option,
    types a free-text "Other" answer, or dismisses (×) to just type in the
@@ -36464,3 +36465,59 @@ body.theme-frosted .modal {
    the input beside it (.confirm-btn won't stretch on its own). */
 .ask-user-other-send { flex-shrink: 0; white-space: nowrap; min-height: 39px; }
 .ask-user-other-send:disabled { opacity: 0.5; cursor: default; }
+
+/* Atlas pane (MVP1) */
+body.atlas-view { overflow: hidden; }
+.atlas-pane {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  left: var(--sidebar-w, 280px);
+  z-index: 900;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+.atlas-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.atlas-header h2 { margin: 0; font-size: 1rem; color: var(--fg); }
+.atlas-header-actions { display: flex; gap: 8px; align-items: center; }
+.atlas-close-btn {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--fg); border-radius: 4px; padding: 2px 8px; cursor: pointer;
+}
+.atlas-body { flex: 1; display: flex; min-height: 0; }
+.atlas-sidebar {
+  width: 220px; flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  overflow-y: auto; padding: 8px;
+}
+.atlas-sidebar-title {
+  font-size: 10px; text-transform: uppercase;
+  opacity: 0.6; margin: 8px 4px 4px;
+}
+.atlas-list-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 8px; border-radius: 4px; cursor: pointer;
+  font-size: 12px;
+}
+.atlas-list-item:hover { background: var(--panel); }
+.atlas-list-item.active { background: var(--panel); outline: 1px solid var(--border); }
+.atlas-list-meta { opacity: 0.55; font-size: 10px; }
+.atlas-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.atlas-toolbar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 12px; border-bottom: 1px solid var(--border); gap: 8px;
+}
+.atlas-toolbar-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.atlas-data-body { flex: 1; overflow: auto; padding: 8px 12px; }
+.atlas-empty { opacity: 0.55; font-size: 12px; padding: 8px; }
+@media (max-width: 768px) {
+  .atlas-pane { left: 0; }
+  .atlas-sidebar { width: 160px; }
+}

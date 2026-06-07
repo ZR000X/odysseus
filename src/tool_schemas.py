@@ -594,6 +594,55 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "manage_atlas",
+            "description": "Manage Atlas structured data: worlds, entities (schemas), and rows. Use for datasets, catalogues, tabular data — NOT manage_memory or Documents unless the user wants a document. Default limit=20 on list_rows. Use import_rows for bulk CSV. world_id optional (uses default world).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "list_worlds", "create_world", "list_entities", "create_entity",
+                            "add_attribute", "list_rows", "count_rows", "add_row", "update_row",
+                            "delete_row", "import_rows", "export_csv"
+                        ],
+                        "description": "Action to perform",
+                    },
+                    "world_id": {"type": "string", "description": "Atlas world UUID (optional; default world used if omitted)"},
+                    "entity_id": {"type": "string", "description": "Entity UUID or 8-char prefix"},
+                    "entity_name": {"type": "string", "description": "Entity name (lookup or create)"},
+                    "name": {"type": "string", "description": "World or entity name"},
+                    "description": {"type": "string", "description": "World or entity description"},
+                    "attributes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "type": {"type": "string", "enum": ["text", "integer", "real", "boolean"]},
+                                "primary_key": {"type": "boolean"},
+                                "unique": {"type": "boolean"},
+                            },
+                            "required": ["name"],
+                        },
+                        "description": "Column definitions for create_entity",
+                    },
+                    "row": {"type": "object", "description": "Row data keyed by column slug/name"},
+                    "row_id": {"type": "integer", "description": "_atlas_row_id for update/delete"},
+                    "limit": {"type": "integer", "description": "Max rows to return (default 20, max 100)"},
+                    "offset": {"type": "integer", "description": "Pagination offset"},
+                    "filter_col": {"type": "string", "description": "Column to filter on"},
+                    "filter_val": {"type": "string", "description": "Filter value"},
+                    "csv": {"type": "string", "description": "CSV text for import_rows"},
+                    "mode": {"type": "string", "enum": ["append", "merge", "replace"], "description": "Import mode"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "api_call",
             "description": "Call a registered API integration (RSS reader, git forge, bookmark manager, smart home, etc.). Check the system context for available integrations and their endpoints.",
             "parameters": {

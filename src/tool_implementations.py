@@ -2039,6 +2039,201 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Atlas tool — structured data worlds
+# ---------------------------------------------------------------------------
+
+async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
+    """Handle manage_atlas tool calls: worlds, entities, rows, CSV import."""
+    from services.atlas import worlds as atlas_worlds
+    from services.atlas import entities as atlas_entities
+    from services.atlas import rows as atlas_rows
+    from services.atlas import csv_io as atlas_csv
+    from services.atlas.worlds import AtlasNotFoundError, AtlasAccessError
+
+    try:
+        args = _parse_tool_args(content)
+    except ValueError:
+        return {"error": "Invalid JSON arguments", "exit_code": 1}
+
+    action = (args.get("action") or "").replace("-", "_").strip().lower()
+    _ALIASES = {"create": "create_world", "query": "list_rows", "import": "import_rows", "export": "export_csv"}
+    if action in ("create_entity", "new_entity"):
+        action = "create_entity"
+    elif action == "create" and args.get("entity_id"):
+        action = "add_row"
+    elif action == "create" and (args.get("attributes") or args.get("entity_name")):
+        action = "create_entity"
+    elif action == "create":
+        action = "create_world"
+    action = _ALIASES.get(action, action)
+
+    def _resolve_world_id() -> str:
+        wid = args.get("world_id")
+        if wid:
+            w = atlas_worlds.get_world(owner, wid)
+            return w["id"]
+        return atlas_worlds.resolve_default_world(owner)["id"]
+
+    def _resolve_entity_id(world_id: str) -> str:
+        eid = args.get("entity_id")
+        if eid:
+            entities = atlas_entities.list_entities(owner, world_id)
+            for e in entities:
+                if e["id"] == eid or e["id"].startswith(str(eid)):
+                    return e["id"]
+            raise AtlasNotFoundError(f"Entity not found: {eid}")
+        name = args.get("entity_name") or args.get("name")
+        if name and action not in ("create_world", "list_worlds", "create_entity"):
+            entities = atlas_entities.list_entities(owner, world_id)
+            for e in entities:
+                if e["name"].lower() == name.strip().lower():
+                    return e["id"]
+        raise ValueError("entity_id or entity_name required")
+
+    try:
+        if action == "list_worlds":
+            worlds = atlas_worlds.list_worlds(owner)
+            if not worlds:
+                return {"response": "No Atlas worlds yet.", "exit_code": 0}
+            lines = [f"- [{w['id'][:8]}] **{w['name']}** ({w['entity_count']} entities, {w['row_count']} rows)" for w in worlds]
+            return {"results": "\n".join(lines), "exit_code": 0}
+
+        if action == "create_world":
+            w = atlas_worlds.create_world(owner, args.get("name") or "New World", args.get("description") or "")
+            return {
+                "response": f"Created world \"{w['name']}\" (id: {w['id'][:8]})",
+                "world_id": w["id"],
+                "world_name": w["name"],
+                "exit_code": 0,
+            }
+
+        world_id = _resolve_world_id()
+
+        if action == "list_entities":
+            entities = atlas_entities.list_entities(owner, world_id)
+            if not entities:
+                return {"response": "No entities in this world.", "exit_code": 0}
+            lines = []
+            for e in entities:
+                attrs = ", ".join(a["name"] for a in e["attributes"]) or "(no columns)"
+                lines.append(f"- [{e['id'][:8]}] **{e['name']}** ({e['row_count']} rows) — {attrs}")
+            return {"results": "\n".join(lines), "world_id": world_id, "exit_code": 0}
+
+        if action == "create_entity":
+            attrs = args.get("attributes") or []
+            if isinstance(attrs, dict):
+                attrs = [{"name": k, "type": v} for k, v in attrs.items()]
+            e = atlas_entities.create_entity(
+                owner, world_id,
+                args.get("name") or args.get("entity_name") or "Untitled",
+                attributes=attrs,
+                description=args.get("description") or "",
+            )
+            return {
+                "response": f"Created entity \"{e['name']}\" (id: {e['id'][:8]})",
+                "world_id": world_id,
+                "entity_id": e["id"],
+                "entity_name": e["name"],
+                "exit_code": 0,
+            }
+
+        if action == "add_attribute":
+            entity_id = _resolve_entity_id(world_id)
+            e = atlas_entities.add_attribute(
+                owner, world_id, entity_id,
+                args.get("name") or args.get("attribute_name") or "",
+                attr_type=args.get("type") or args.get("attr_type") or "text",
+                nullable=args.get("nullable", True),
+                is_primary_key=bool(args.get("primary_key") or args.get("is_primary_key")),
+                is_unique=bool(args.get("unique") or args.get("is_unique")),
+            )
+            return {"response": f"Added attribute to {e['name']}", "entity_id": entity_id, "exit_code": 0}
+
+        entity_id = _resolve_entity_id(world_id)
+
+        if action == "list_rows":
+            limit = min(int(args.get("limit") or 20), 100)
+            offset = int(args.get("offset") or 0)
+            result = atlas_rows.list_rows(
+                owner, world_id, entity_id,
+                limit=limit, offset=offset,
+                filter_col=args.get("filter_col") or args.get("column"),
+                filter_val=args.get("filter_val") or args.get("filter"),
+            )
+            entity = atlas_entities.get_entity(owner, world_id, entity_id)
+            if not result["rows"]:
+                return {"response": f"No rows in {entity['name']} (total: {result['total']}).", "exit_code": 0}
+            cols = ["_atlas_row_id"] + [a["slug"] for a in entity["attributes"]]
+            lines = [f"Showing {len(result['rows'])} of {result['total']} rows in **{entity['name']}**:"]
+            for r in result["rows"]:
+                parts = [f"{c}={r.get(c, '')}" for c in cols]
+                lines.append(f"- [{r['_atlas_row_id']}] " + ", ".join(parts))
+            return {"results": _truncate("\n".join(lines)), "exit_code": 0}
+
+        if action == "count_rows":
+            n = atlas_rows.count_rows(owner, world_id, entity_id)
+            entity = atlas_entities.get_entity(owner, world_id, entity_id)
+            return {"response": f"{entity['name']}: {n} rows", "count": n, "exit_code": 0}
+
+        if action == "add_row":
+            row = args.get("row") or args.get("data") or {}
+            if not row:
+                row = {k: v for k, v in args.items() if k not in (
+                    "action", "world_id", "entity_id", "entity_name", "owner")}
+            r = atlas_rows.add_row(owner, world_id, entity_id, row)
+            return {
+                "response": f"Added row {r['row_id']}",
+                "row_id": r["row_id"],
+                "entity_id": entity_id,
+                "world_id": world_id,
+                "exit_code": 0,
+            }
+
+        if action == "update_row":
+            row_id = int(args.get("row_id") or args.get("_atlas_row_id"))
+            row = args.get("row") or args.get("data") or {}
+            if not row:
+                row = {k: v for k, v in args.items() if k not in (
+                    "action", "world_id", "entity_id", "row_id", "_atlas_row_id")}
+            r = atlas_rows.update_row(owner, world_id, entity_id, row_id, row)
+            return {"response": f"Updated row {row_id}", "row_id": row_id, "exit_code": 0}
+
+        if action == "delete_row":
+            row_id = int(args.get("row_id") or args.get("_atlas_row_id"))
+            atlas_rows.delete_row(owner, world_id, entity_id, row_id)
+            return {"response": f"Deleted row {row_id}", "exit_code": 0}
+
+        if action == "import_rows":
+            csv_text = args.get("csv") or args.get("csv_text") or args.get("content") or ""
+            if not csv_text:
+                return {"error": "csv text required for import_rows", "exit_code": 1}
+            stats = atlas_csv.import_rows(
+                owner, world_id, entity_id, csv_text,
+                mode=args.get("mode") or "append",
+            )
+            return {
+                "response": (
+                    f"Import complete: {stats['rows_inserted']} inserted, "
+                    f"{stats['rows_updated']} updated, {stats['rows_failed']} failed"
+                ),
+                "stats": stats,
+                "exit_code": 0,
+            }
+
+        if action == "export_csv":
+            text = atlas_csv.export_csv(owner, world_id, entity_id)
+            return {"results": _truncate(text), "exit_code": 0}
+
+        return {"error": f"Unknown action: {action}", "exit_code": 1}
+
+    except (AtlasNotFoundError, AtlasAccessError) as e:
+        return {"error": str(e), "exit_code": 1}
+    except Exception as e:
+        logger.error(f"manage_atlas error: {e}", exc_info=True)
+        return {"error": str(e), "exit_code": 1}
+
+
+# ---------------------------------------------------------------------------
 # Calendar tool — CalDAV-backed event CRUD
 # ---------------------------------------------------------------------------
 
