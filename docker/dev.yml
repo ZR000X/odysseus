@@ -1,0 +1,38 @@
+# Parallel dev stack overlay. Use with explicit -f flags (works on Windows/Linux/macOS):
+#   docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --build
+#
+# Open http://localhost:7001 (default dev port). Production on 7000 is untouched.
+#
+# GPU on dev — chain a third -f (dev before GPU):
+#   docker compose -f docker-compose.yml -f docker/dev.yml -f docker/gpu.nvidia.yml --env-file .env.dev up -d --build
+#
+# Host port map (prod → dev): Odysseus 7000→7001, SearXNG 8080→8081,
+# ChromaDB 8100→8101, ntfy 8091→8092. Internal service DNS is unchanged.
+# ports use !override so compose merge replaces (does not append) base bindings.
+services:
+  odysseus:
+    ports: !override
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7001}:7000"
+    volumes:
+      - ./data-dev:/app/data:z
+      - ./logs-dev:/app/logs:z
+      - ./data-dev/ssh:/app/.ssh:z
+      - ./data-dev/huggingface:/app/.cache/huggingface:z
+      - ./data-dev/local:/app/.local:z
+    restart: "no"
+
+  chromadb:
+    ports: !override
+      - "${CHROMADB_BIND:-127.0.0.1}:8101:8000"
+
+  searxng:
+    ports: !override
+      - "127.0.0.1:8081:8080"
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8081/
+
+  ntfy:
+    ports: !override
+      - "${NTFY_BIND:-127.0.0.1}:8092:80"
+    environment:
+      NTFY_BASE_URL: http://localhost:8092

@@ -31,6 +31,19 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+**Parallel Docker dev instance** — when a production stack is already running
+and you want an isolated copy for branch testing (separate `./data-dev`, port
+7001):
+
+```bash
+cp .env.dev.example .env.dev
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --build
+# → http://localhost:7001
+
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs --tail=120 odysseus
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev down   # stops dev only
+```
+
 Manual development uses Python 3.11+:
 
 ```bash
