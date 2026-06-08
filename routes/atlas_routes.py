@@ -4,8 +4,8 @@
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 
 from src.auth_helpers import get_current_user
@@ -14,8 +14,10 @@ from services.atlas import entities as atlas_entities
 from services.atlas import rows as atlas_rows
 from services.atlas import documents as atlas_documents
 from services.atlas import csv_io as atlas_csv
+from services.atlas import xlsx_io as atlas_xlsx
 from services.atlas import canvas as atlas_canvas
 from services.atlas import relationships as atlas_relationships
+from services.atlas import clusters as atlas_clusters
 from services.atlas.worlds import AtlasNotFoundError, AtlasAccessError
 
 logger = logging.getLogger(__name__)
@@ -80,14 +82,62 @@ class ImportBody(BaseModel):
     csv: str
 
 
+class SheetMapping(BaseModel):
+    sheet_name: str
+    action: str = "create_new"  # import_to_existing | create_new | skip
+    entity_id: Optional[str] = None
+    entity_name: Optional[str] = None
+    mode: Optional[str] = None
+
+
+class WorldImportBody(BaseModel):
+    mappings: List[SheetMapping]
+    default_mode: str = "append"
+    restore_meta: bool = True
+    world_name: Optional[str] = None
+    world_description: str = ""
+
+
+class NewWorldImportBody(WorldImportBody):
+    pass
+
+
 class CanvasSaveBody(BaseModel):
     nodes: List[Dict[str, Any]]
+    clusters: List[Dict[str, Any]] = []
+
+
+class ClusterCreate(BaseModel):
+    name: str
+    description: str = ""
+    x: float = 0
+    y: float = 0
+    w: float = 400
+    h: float = 300
+    parent_cluster_id: Optional[str] = None
+    color: str = ""
+    z_index: int = 0
+
+
+class ClusterUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
+    w: Optional[float] = None
+    h: Optional[float] = None
+    parent_cluster_id: Optional[str] = None
+    color: Optional[str] = None
+    z_index: Optional[int] = None
+    collapsed: Optional[bool] = None
 
 
 class RelationshipCreate(BaseModel):
     from_entity_id: str
     to_entity_id: str
     rel_type: str = "one_to_many"
+    from_cardinality: Optional[str] = None
+    to_cardinality: Optional[str] = None
     from_field: str = ""
     to_field: str = ""
     label: str = ""
@@ -97,6 +147,8 @@ class RelationshipCreate(BaseModel):
 
 class RelationshipUpdate(BaseModel):
     rel_type: Optional[str] = None
+    from_cardinality: Optional[str] = None
+    to_cardinality: Optional[str] = None
     from_field: Optional[str] = None
     to_field: Optional[str] = None
     label: Optional[str] = None
@@ -358,6 +410,91 @@ def setup_atlas_routes() -> APIRouter:
         except Exception as e:
             _handle_err(e)
 
+    @router.get("/api/atlas/worlds/{world_id}/export.xlsx")
+    async def export_world_xlsx(request: Request, world_id: str):
+        owner = _owner(request)
+        try:
+            data, stats = atlas_xlsx.export_world(owner, world_id)
+            world = atlas_worlds.get_world(owner, world_id)
+            filename = f"{world['name'].replace(' ', '_')}.xlsx"
+            return Response(
+                content=data,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-Atlas-Entity-Count": str(stats.get("entity_count", 0)),
+                    "X-Atlas-Document-Count": str(stats.get("document_count", 0)),
+                    "X-Atlas-Relationship-Count": str(stats.get("relationship_count", 0)),
+                },
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    @router.post("/api/atlas/worlds/{world_id}/import/analyze")
+    async def analyze_world_import(request: Request, world_id: str, file: UploadFile = File(...)):
+        owner = _owner(request)
+        try:
+            raw = await file.read()
+            return atlas_xlsx.analyze_import(owner, raw, world_id=world_id)
+        except Exception as e:
+            _handle_err(e)
+
+    @router.post("/api/atlas/worlds/{world_id}/import")
+    async def import_world_xlsx(
+        request: Request,
+        world_id: str,
+        file: UploadFile = File(...),
+        metadata: str = Form("{}"),
+    ):
+        owner = _owner(request)
+        try:
+            import json as _json
+            meta = _json.loads(metadata or "{}")
+            req = WorldImportBody(**meta)
+            raw = await file.read()
+            mappings = [m.model_dump() for m in req.mappings]
+            return atlas_xlsx.import_world(
+                owner, raw, mappings,
+                world_id=world_id,
+                default_mode=req.default_mode,
+                restore_meta=req.restore_meta,
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    @router.post("/api/atlas/worlds/import/analyze")
+    async def analyze_new_world_import(request: Request, file: UploadFile = File(...)):
+        owner = _owner(request)
+        try:
+            raw = await file.read()
+            return atlas_xlsx.analyze_import(owner, raw, world_id=None)
+        except Exception as e:
+            _handle_err(e)
+
+    @router.post("/api/atlas/worlds/import")
+    async def import_new_world_xlsx(
+        request: Request,
+        file: UploadFile = File(...),
+        metadata: str = Form("{}"),
+    ):
+        owner = _owner(request)
+        try:
+            import json as _json
+            meta = _json.loads(metadata or "{}")
+            req = NewWorldImportBody(**meta)
+            raw = await file.read()
+            mappings = [m.model_dump() for m in req.mappings]
+            return atlas_xlsx.import_world(
+                owner, raw, mappings,
+                world_id=None,
+                world_name=req.world_name,
+                world_description=req.world_description or "",
+                default_mode=req.default_mode,
+                restore_meta=req.restore_meta,
+            )
+        except Exception as e:
+            _handle_err(e)
+
     # Canvas
     @router.get("/api/atlas/worlds/{world_id}/canvas")
     async def get_canvas(request: Request, world_id: str):
@@ -371,7 +508,56 @@ def setup_atlas_routes() -> APIRouter:
     async def put_canvas(request: Request, world_id: str, body: CanvasSaveBody):
         owner = _owner(request)
         try:
-            return atlas_canvas.save_layout(owner, world_id, body.nodes)
+            return atlas_canvas.save_layout(
+                owner, world_id, body.nodes, clusters=body.clusters,
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    # Clusters
+    @router.get("/api/atlas/worlds/{world_id}/clusters")
+    async def list_clusters(request: Request, world_id: str):
+        owner = _owner(request)
+        try:
+            return {"clusters": atlas_clusters.list_clusters(owner, world_id)}
+        except Exception as e:
+            _handle_err(e)
+
+    @router.post("/api/atlas/worlds/{world_id}/clusters")
+    async def create_cluster(request: Request, world_id: str, body: ClusterCreate):
+        owner = _owner(request)
+        try:
+            return atlas_clusters.create_cluster(
+                owner, world_id,
+                body.name,
+                x=body.x, y=body.y, w=body.w, h=body.h,
+                parent_cluster_id=body.parent_cluster_id,
+                color=body.color,
+                z_index=body.z_index,
+                description=body.description,
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    @router.put("/api/atlas/worlds/{world_id}/clusters/{cluster_id}")
+    async def update_cluster(
+        request: Request, world_id: str, cluster_id: str, body: ClusterUpdate,
+    ):
+        owner = _owner(request)
+        try:
+            return atlas_clusters.update_cluster(
+                owner, world_id, cluster_id,
+                **body.model_dump(exclude_unset=True),
+            )
+        except Exception as e:
+            _handle_err(e)
+
+    @router.delete("/api/atlas/worlds/{world_id}/clusters/{cluster_id}")
+    async def delete_cluster(request: Request, world_id: str, cluster_id: str):
+        owner = _owner(request)
+        try:
+            atlas_clusters.delete_cluster(owner, world_id, cluster_id)
+            return {"ok": True}
         except Exception as e:
             _handle_err(e)
 
@@ -394,6 +580,8 @@ def setup_atlas_routes() -> APIRouter:
                 body.rel_type, body.from_field, body.to_field,
                 label=body.label,
                 from_anchor=body.from_anchor, to_anchor=body.to_anchor,
+                from_cardinality=body.from_cardinality,
+                to_cardinality=body.to_cardinality,
             )
         except Exception as e:
             _handle_err(e)

@@ -69,6 +69,7 @@ def atlas_env(tmp_path, monkeypatch):
     documents_mod = _load_atlas_module("documents", "documents.py")
     rows_mod = _load_atlas_module("rows", "rows.py")
     csv_mod = _load_atlas_module("csv_io", "csv_io.py")
+    clusters_mod = _load_atlas_module("clusters", "clusters.py")
     canvas_mod = _load_atlas_module("canvas", "canvas.py")
     rels_mod = _load_atlas_module("relationships", "relationships.py")
     search_mod = _load_atlas_module("search", "search.py")
@@ -83,6 +84,7 @@ def atlas_env(tmp_path, monkeypatch):
         "csv": csv_mod,
         "canvas": canvas_mod,
         "relationships": rels_mod,
+        "clusters": clusters_mod,
         "ddl": ddl,
         "search": search_mod,
     }
@@ -233,6 +235,53 @@ async def test_relationship_crud(atlas_env):
     rels = atlas_env["relationships"].list_relationships(atlas_env["owner"], w["id"])
     assert len(rels) == 1
     assert rels[0]["id"] == r["id"]
+    assert rels[0]["from_cardinality"] == "one"
+    assert rels[0]["to_cardinality"] == "many"
+
+
+@pytest.mark.asyncio
+async def test_relationship_cardinality_one_or_zero(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+    r = atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many", "", "",
+        from_cardinality="one_or_zero", to_cardinality="many",
+    )
+    assert r["rel_type"] == "one_or_zero_to_many"
+    assert r["from_cardinality"] == "one_or_zero"
+    assert r["to_cardinality"] == "many"
+
+    updated = atlas_env["relationships"].update_relationship(
+        atlas_env["owner"], w["id"], r["id"],
+        from_cardinality="one", to_cardinality="one_or_zero",
+    )
+    assert updated["rel_type"] == "one_to_one_or_zero"
+    assert updated["from_cardinality"] == "one"
+    assert updated["to_cardinality"] == "one_or_zero"
+
+
+@pytest.mark.asyncio
+async def test_relationship_invalid_cardinality(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+    with pytest.raises(ValueError):
+        atlas_env["relationships"].create_relationship(
+            atlas_env["owner"], w["id"],
+            a["id"], b["id"], "one_to_many", "", "",
+            from_cardinality="invalid", to_cardinality="many",
+        )
+    r = atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many", "", "",
+    )
+    with pytest.raises(ValueError):
+        atlas_env["relationships"].update_relationship(
+            atlas_env["owner"], w["id"], r["id"],
+            rel_type="not_a_real_type",
+        )
 
 
 @pytest.mark.asyncio
@@ -244,6 +293,121 @@ async def test_canvas_layout(atlas_env):
     node = next(n for n in layout["nodes"] if n["entity_id"] == e["id"])
     assert node["x"] == 100
     assert node["y"] == 200
+
+
+@pytest.mark.asyncio
+async def test_canvas_layout(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    atlas_env["canvas"].upsert_node(atlas_env["owner"], w["id"], e["id"], 100, 200)
+    layout = atlas_env["canvas"].get_layout(atlas_env["owner"], w["id"])
+    node = next(n for n in layout["nodes"] if n["entity_id"] == e["id"])
+    assert node["x"] == 100
+    assert node["y"] == 200
+    assert layout["clusters"] == []
+
+
+@pytest.mark.asyncio
+async def test_cluster_crud_and_nested(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    outer = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Work", x=0, y=0, w=500, h=400,
+    )
+    inner = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Project X",
+        x=50, y=50, w=200, h=150, parent_cluster_id=outer["id"],
+    )
+    listed = atlas_env["clusters"].list_clusters(atlas_env["owner"], w["id"])
+    assert len(listed) == 2
+    assert inner["parent_cluster_id"] == outer["id"]
+
+
+@pytest.mark.asyncio
+async def test_hit_test_cluster_innermost(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    outer = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Outer", x=0, y=0, w=400, h=300,
+    )
+    inner = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Inner",
+        x=50, y=50, w=150, h=100, parent_cluster_id=outer["id"],
+    )
+    clusters = atlas_env["clusters"].list_clusters(atlas_env["owner"], w["id"])
+    hit = atlas_env["clusters"].hit_test_cluster(100, 100, clusters)
+    assert hit == inner["id"]
+
+
+@pytest.mark.asyncio
+async def test_canvas_cluster_roundtrip(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    c = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Personal", x=10, y=10,
+    )
+    atlas_env["canvas"].save_layout(
+        atlas_env["owner"], w["id"],
+        [{"entity_id": e["id"], "x": 40, "y": 40, "w": 200, "h": 120, "z_index": 0, "cluster_id": c["id"]}],
+        clusters=[{**c, "x": 10, "y": 10, "w": 400, "h": 300, "collapsed": False}],
+    )
+    layout = atlas_env["canvas"].get_layout(atlas_env["owner"], w["id"])
+    node = next(n for n in layout["nodes"] if n["entity_id"] == e["id"])
+    assert node["cluster_id"] == c["id"]
+    assert len(layout["clusters"]) == 1
+    assert layout["clusters"][0]["name"] == "Personal"
+
+
+@pytest.mark.asyncio
+async def test_delete_cluster_reparents(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    outer = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Outer", x=0, y=0, w=500, h=400,
+    )
+    inner = atlas_env["clusters"].create_cluster(
+        atlas_env["owner"], w["id"], "Inner",
+        x=50, y=50, w=200, h=150, parent_cluster_id=outer["id"],
+    )
+    atlas_env["clusters"].assign_entity_to_cluster(
+        atlas_env["owner"], w["id"], e["id"], inner["id"],
+    )
+    atlas_env["clusters"].delete_cluster(atlas_env["owner"], w["id"], outer["id"])
+    layout = atlas_env["canvas"].get_layout(atlas_env["owner"], w["id"])
+    node = next(n for n in layout["nodes"] if n["entity_id"] == e["id"])
+    assert node["cluster_id"] == inner["id"]
+    remaining = atlas_env["clusters"].list_clusters(atlas_env["owner"], w["id"])
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == inner["id"]
+    assert remaining[0]["parent_cluster_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_clusters(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "create_world", "name": "Cluster World",
+    }), owner=atlas_env["owner"])
+    wid = r["world_id"]
+
+    r2 = await do_manage_atlas(json.dumps({
+        "action": "create_cluster", "world_id": wid, "name": "Work",
+    }), owner=atlas_env["owner"])
+    assert r2["exit_code"] == 0
+    assert r2.get("cluster_id")
+
+    r3 = await do_manage_atlas(json.dumps({
+        "action": "create_entity", "world_id": wid, "name": "Orders",
+    }), owner=atlas_env["owner"])
+
+    r4 = await do_manage_atlas(json.dumps({
+        "action": "assign_entity_to_cluster",
+        "world_id": wid,
+        "entity_name": "Orders",
+        "cluster_name": "Work",
+    }), owner=atlas_env["owner"])
+    assert r4["exit_code"] == 0
+    assert "Work" in r4.get("response", "")
 
 
 @pytest.mark.asyncio
@@ -318,18 +482,22 @@ async def test_delete_world(atlas_env):
         atlas_env["worlds"].get_world(atlas_env["owner"], w["id"])
 
 
-def test_legacy_world_db_gets_v2_tables(atlas_env):
-    """Opening a pre-v2 world DB adds atlas_fields and related tables."""
+def test_legacy_world_db_gets_v3_tables(atlas_env):
+    """Opening a pre-v3 world DB adds atlas_clusters and cluster_id column."""
     wdb = sys.modules["services.atlas.world_db"]
     legacy_path = atlas_env["worlds_dir"] / "legacy.db"
     conn = sqlite3.connect(legacy_path)
     conn.executescript("""
         CREATE TABLE atlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        INSERT INTO atlas_meta VALUES ('schema_version', '1');
+        INSERT INTO atlas_meta VALUES ('schema_version', '2');
         CREATE TABLE atlas_entities (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
             table_name TEXT NOT NULL UNIQUE, row_count INTEGER NOT NULL DEFAULT 0,
             created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE atlas_canvas_nodes (
+            entity_id TEXT PRIMARY KEY, x REAL NOT NULL DEFAULT 0, y REAL NOT NULL DEFAULT 0,
+            w REAL NOT NULL DEFAULT 200, h REAL NOT NULL DEFAULT 120, z_index INTEGER NOT NULL DEFAULT 0
         );
     """)
     conn.close()
@@ -340,13 +508,13 @@ def test_legacy_world_db_gets_v2_tables(atlas_env):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        assert "atlas_fields" in tables
-        assert "atlas_canvas_nodes" in tables
-        assert "atlas_relationships" in tables
+        assert "atlas_clusters" in tables
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(atlas_canvas_nodes)").fetchall()}
+        assert "cluster_id" in cols
         ver = conn.execute(
             "SELECT value FROM atlas_meta WHERE key='schema_version'"
         ).fetchone()[0]
-        assert int(ver) == 2
+        assert int(ver) == 3
 
 
 def _tool_env_patch(atlas_env, monkeypatch):
@@ -505,6 +673,32 @@ async def test_do_manage_atlas_create_relationship_by_name(atlas_env, monkeypatc
     }), owner=atlas_env["owner"])
     assert r["exit_code"] == 0
     assert "Customers.id" in r["response"]
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_create_relationship_cardinality(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "create_relationship",
+        "world_id": w["id"],
+        "from_entity_name": "A",
+        "to_entity_name": "B",
+        "from_field": "id",
+        "to_field": "a_id",
+        "from_cardinality": "one_or_zero",
+        "to_cardinality": "many",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    rel = atlas_env["relationships"].list_relationships(atlas_env["owner"], w["id"])[0]
+    assert rel["rel_type"] == "one_or_zero_to_many"
+    assert rel["from_cardinality"] == "one_or_zero"
+    assert rel["to_cardinality"] == "many"
 
 
 @pytest.mark.asyncio

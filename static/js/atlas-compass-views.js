@@ -3,6 +3,7 @@
  */
 import { renderCompassDocument, highlightJson } from './atlas-json-tree.js';
 import { toastCopied } from './atlas-toast.js';
+import { buildDocKeyIndex, docGetField } from './atlas-field-resolve.js';
 
 function _esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -18,9 +19,12 @@ function _typeLabel(v, inferred) {
   return 'String';
 }
 
-function _renderCellHtml(v, typeHint) {
-  if (v === null || v === undefined) {
+function _renderCellHtml(v, typeHint, has = true) {
+  if (!has) {
     return '<span class="atlas-table-missing">No field</span>';
+  }
+  if (v === null || v === undefined) {
+    return '<span class="atlas-json-null">null</span>';
   }
   const t = typeof v;
   if (t === 'string') return `<span class="atlas-json-str">"${_esc(v)}"</span>`;
@@ -93,10 +97,16 @@ export function renderTableView(docs, fields) {
   const rows = docs.map((doc, idx) => {
     const id = doc._id ?? doc._atlas_row_id ?? '';
     const idType = _typeLabel(id, idField?.inferred_type);
+    const keyIndex = buildDocKeyIndex(doc);
     const cells = fieldCols.map(f => {
-      const v = doc[f.slug];
-      const has = Object.prototype.hasOwnProperty.call(doc, f.slug);
-      const inner = has ? _renderCellHtml(v, f.inferred_type) : '<span class="atlas-table-missing">No field</span>';
+      const sampleKey = f.sample_key;
+      const resolvedSlug = sampleKey && Object.prototype.hasOwnProperty.call(doc, sampleKey)
+        ? sampleKey
+        : null;
+      const { value: v, has } = resolvedSlug
+        ? { value: doc[resolvedSlug], has: true }
+        : docGetField(doc, f.slug, keyIndex);
+      const inner = _renderCellHtml(v, f.inferred_type, has);
       const title = has && typeof v === 'object' ? _esc(JSON.stringify(v)) : _esc(_cellValue(v));
       return `<td title="${title}">${inner}</td>`;
     }).join('');

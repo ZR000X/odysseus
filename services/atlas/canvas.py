@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from services.atlas import clusters as atlas_clusters
 from services.atlas.entities import list_entities
 from services.atlas.world_db import open_world_db
 from services.atlas.worlds import get_world
@@ -24,6 +25,7 @@ def _default_layout(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "w": DEFAULT_W,
             "h": DEFAULT_H,
             "z_index": 0,
+            "cluster_id": None,
             "name": e["name"],
             "row_count": e["row_count"],
         })
@@ -33,7 +35,7 @@ def _default_layout(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def get_layout(owner: Optional[str], world_id: str) -> Dict[str, Any]:
     world = get_world(owner, world_id)
     entities = list_entities(owner, world_id)
-    entity_map = {e["id"]: e for e in entities}
+    clusters = atlas_clusters.list_clusters(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
         rows = conn.execute("SELECT * FROM atlas_canvas_nodes").fetchall()
     saved = {r["entity_id"]: dict(r) for r in rows}
@@ -41,10 +43,12 @@ def get_layout(owner: Optional[str], world_id: str) -> Dict[str, Any]:
     for e in entities:
         if e["id"] in saved:
             n = saved[e["id"]]
+            cluster_id = n.get("cluster_id")
             nodes.append({
                 "entity_id": e["id"],
                 "x": n["x"], "y": n["y"], "w": n["w"], "h": n["h"],
                 "z_index": n["z_index"],
+                "cluster_id": cluster_id,
                 "name": e["name"],
                 "row_count": e["row_count"],
             })
@@ -57,7 +61,7 @@ def get_layout(owner: Optional[str], world_id: str) -> Dict[str, Any]:
             nodes.append(d)
     elif not nodes:
         nodes = _default_layout(entities)
-    return {"nodes": nodes}
+    return {"nodes": nodes, "clusters": clusters}
 
 
 def upsert_node(
@@ -69,31 +73,43 @@ def upsert_node(
     w: float = DEFAULT_W,
     h: float = DEFAULT_H,
     z_index: int = 0,
+    cluster_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     world = get_world(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
         conn.execute(
-            """INSERT INTO atlas_canvas_nodes (entity_id, x, y, w, h, z_index)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO atlas_canvas_nodes (entity_id, x, y, w, h, z_index, cluster_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(entity_id) DO UPDATE SET
-                 x=excluded.x, y=excluded.y, w=excluded.w, h=excluded.h, z_index=excluded.z_index""",
-            (entity_id, x, y, w, h, z_index),
+                 x=excluded.x, y=excluded.y, w=excluded.w, h=excluded.h,
+                 z_index=excluded.z_index, cluster_id=excluded.cluster_id""",
+            (entity_id, x, y, w, h, z_index, cluster_id),
         )
-    return {"entity_id": entity_id, "x": x, "y": y, "w": w, "h": h, "z_index": z_index}
+    return {
+        "entity_id": entity_id, "x": x, "y": y, "w": w, "h": h,
+        "z_index": z_index, "cluster_id": cluster_id,
+    }
 
 
-def save_layout(owner: Optional[str], world_id: str, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+def save_layout(
+    owner: Optional[str],
+    world_id: str,
+    nodes: List[Dict[str, Any]],
+    clusters: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     world = get_world(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
         for n in nodes:
             eid = n.get("entity_id")
             if not eid:
                 continue
+            cluster_id = n.get("cluster_id")
             conn.execute(
-                """INSERT INTO atlas_canvas_nodes (entity_id, x, y, w, h, z_index)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                """INSERT INTO atlas_canvas_nodes (entity_id, x, y, w, h, z_index, cluster_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(entity_id) DO UPDATE SET
-                     x=excluded.x, y=excluded.y, w=excluded.w, h=excluded.h, z_index=excluded.z_index""",
+                     x=excluded.x, y=excluded.y, w=excluded.w, h=excluded.h,
+                     z_index=excluded.z_index, cluster_id=excluded.cluster_id""",
                 (
                     eid,
                     float(n.get("x", 0)),
@@ -101,8 +117,11 @@ def save_layout(owner: Optional[str], world_id: str, nodes: List[Dict[str, Any]]
                     float(n.get("w", DEFAULT_W)),
                     float(n.get("h", DEFAULT_H)),
                     int(n.get("z_index", 0)),
+                    cluster_id,
                 ),
             )
+    if clusters is not None:
+        atlas_clusters.save_clusters(owner, world_id, clusters)
     return get_layout(owner, world_id)
 
 

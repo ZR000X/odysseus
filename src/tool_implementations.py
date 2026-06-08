@@ -2135,6 +2135,7 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
     from services.atlas import csv_io as atlas_csv
     from services.atlas import relationships as atlas_relationships
     from services.atlas import search as atlas_search
+    from services.atlas import clusters as atlas_clusters
     from services.atlas.worlds import AtlasNotFoundError, AtlasAccessError
 
     try:
@@ -2175,6 +2176,9 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
         "deletemany": "deletemany", "describe_collection": "describe_collection",
         "list_relationships": "list_relationships",
         "create_relationship": "create_relationship",
+        "list_clusters": "list_clusters",
+        "create_cluster": "create_cluster",
+        "assign_entity_to_cluster": "assign_entity_to_cluster",
         "find_world": "find_world", "find_entity": "find_entity",
         "describe_world": "describe_world", "search": "search",
     }
@@ -2370,12 +2374,72 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
                 args.get("rel_type") or "one_to_many",
                 args["from_field"], args["to_field"],
                 label=args.get("label") or "",
+                from_cardinality=args.get("from_cardinality"),
+                to_cardinality=args.get("to_cardinality"),
             )
             return _ctx_world(
                 world, used_default,
                 response=f"Created relationship {from_e['name']}.{args['from_field']} → {to_e['name']}.{args['to_field']}",
                 relationship_id=r["id"],
             )
+
+        if action == "list_clusters":
+            clusters = atlas_clusters.list_clusters(owner, world["id"])
+            if not clusters:
+                return _ctx_world(world, used_default, response="No clusters defined.")
+            cluster_map = {c["id"]: c["name"] for c in clusters}
+            lines = []
+            for c in clusters:
+                parent = cluster_map.get(c.get("parent_cluster_id"), "")
+                parent_note = f" (in {parent})" if parent else ""
+                lines.append(f"- **{c['name']}** — cluster_id: `{c['id'][:8]}`{parent_note}")
+            return _ctx_world(world, used_default, results="\n".join(lines), clusters=clusters)
+
+        if action == "create_cluster":
+            parent = None
+            if args.get("parent_cluster_id") or args.get("parent_cluster_name"):
+                parent_c = atlas_clusters.resolve_cluster(
+                    owner, world["id"],
+                    cluster_id=args.get("parent_cluster_id"),
+                    cluster_name=args.get("parent_cluster_name"),
+                )
+                parent = parent_c["id"]
+            c = atlas_clusters.create_cluster(
+                owner, world["id"],
+                args.get("name") or args.get("cluster_name") or "New Cluster",
+                description=args.get("description") or "",
+                parent_cluster_id=parent,
+                color=args.get("color") or "",
+            )
+            return _ctx_world(
+                world, used_default,
+                response=f'Created cluster "{c["name"]}" (cluster_id: `{c["id"]}`)',
+                cluster_id=c["id"],
+            )
+
+        if action == "assign_entity_to_cluster":
+            entity = atlas_entities.resolve_entity(
+                owner, world["id"],
+                entity_id=args.get("entity_id"),
+                entity_name=args.get("entity_name"),
+            )
+            cluster_id = None
+            if args.get("cluster_id") or args.get("cluster_name"):
+                cluster = atlas_clusters.resolve_cluster(
+                    owner, world["id"],
+                    cluster_id=args.get("cluster_id"),
+                    cluster_name=args.get("cluster_name"),
+                )
+                cluster_id = cluster["id"]
+            atlas_clusters.assign_entity_to_cluster(
+                owner, world["id"], entity["id"], cluster_id,
+            )
+            if cluster_id:
+                c = atlas_clusters.get_cluster(owner, world["id"], cluster_id)
+                msg = f'Assigned **{entity["name"]}** to cluster **{c["name"]}**'
+            else:
+                msg = f'Removed **{entity["name"]}** from all clusters'
+            return _ctx_entity(world, entity, used_default, response=msg)
 
         entity = _resolve_entity(world["id"])
         fields = args.get("fields")

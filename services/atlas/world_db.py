@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 ATLAS_WORLDS_DIR = os.path.join("data", "atlas", "worlds")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _WORLD_BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS atlas_meta (
@@ -74,6 +74,26 @@ CREATE INDEX IF NOT EXISTS ix_atlas_relationships_from
     ON atlas_relationships (from_entity_id);
 CREATE INDEX IF NOT EXISTS ix_atlas_relationships_to
     ON atlas_relationships (to_entity_id);
+
+CREATE TABLE IF NOT EXISTS atlas_clusters (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    description       TEXT DEFAULT '',
+    parent_cluster_id TEXT,
+    x                 REAL NOT NULL DEFAULT 0,
+    y                 REAL NOT NULL DEFAULT 0,
+    w                 REAL NOT NULL DEFAULT 400,
+    h                 REAL NOT NULL DEFAULT 300,
+    color             TEXT DEFAULT '',
+    z_index           INTEGER NOT NULL DEFAULT 0,
+    collapsed         INTEGER NOT NULL DEFAULT 0,
+    created_at        DATETIME NOT NULL,
+    updated_at        DATETIME NOT NULL,
+    FOREIGN KEY (parent_cluster_id) REFERENCES atlas_clusters(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_atlas_clusters_parent
+    ON atlas_clusters (parent_cluster_id);
 """
 
 
@@ -91,13 +111,24 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def ensure_world_schema(conn: sqlite3.Connection) -> int:
-    """Apply additive schema updates idempotently (v1 worlds → v2 tables)."""
+    """Apply additive schema updates idempotently (v1 worlds → current)."""
     conn.executescript(_WORLD_BOOTSTRAP_SQL)
     row = conn.execute(
         "SELECT value FROM atlas_meta WHERE key = 'schema_version'"
     ).fetchone()
     current = int(row[0]) if row else 1
+    if current < 3:
+        if not _table_has_column(conn, "atlas_canvas_nodes", "cluster_id"):
+            conn.execute(
+                "ALTER TABLE atlas_canvas_nodes ADD COLUMN cluster_id TEXT "
+                "REFERENCES atlas_clusters(id) ON DELETE SET NULL"
+            )
     if current < SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO atlas_meta (key, value) VALUES (?, ?)",

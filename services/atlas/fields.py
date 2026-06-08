@@ -84,12 +84,31 @@ def infer_fields_from_document(conn, entity_id: str, document: Dict[str, Any]) -
             )
 
 
+def _sample_key_map(sample: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Map slug -> original document key from a sample document."""
+    if not sample:
+        return {}
+    out: Dict[str, str] = {}
+    for key in sample:
+        if key.startswith("_") and key != "_id":
+            continue
+        try:
+            slug = slugify(key)
+            validate_slug(slug)
+        except ValueError:
+            continue
+        if slug not in out:
+            out[slug] = key
+    return out
+
+
 def load_fields(
     conn,
     entity_id: str,
     *,
     include_stats: bool = True,
     include_sparse: bool = True,
+    sample_key_map: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM atlas_fields WHERE entity_id = ? ORDER BY slug",
@@ -106,6 +125,10 @@ def load_fields(
             "slug": r["slug"],
             "inferred_type": r["inferred_type"],
         }
+        if sample_key_map and r["slug"] in sample_key_map:
+            item["sample_key"] = sample_key_map[r["slug"]]
+        elif sample_key_map is not None:
+            item["sample_key"] = r["slug"]
         if include_stats:
             item["occurrence_count"] = occ
             item["nullable_ratio"] = null_ratio
@@ -123,9 +146,6 @@ def get_schema(
     include_stats: bool = False,
     include_sparse: bool = False,
 ) -> Dict[str, Any]:
-    fields = load_fields(
-        conn, entity_id, include_stats=include_stats, include_sparse=include_sparse,
-    )
     sample = None
     row = conn.execute(
         f'SELECT _atlas_row_id, _atlas_created_at, _atlas_updated_at, data '
@@ -134,6 +154,11 @@ def get_schema(
     if row:
         from services.atlas.documents import row_to_document
         sample = row_to_document(dict(row))
+    key_map = _sample_key_map(sample)
+    fields = load_fields(
+        conn, entity_id, include_stats=include_stats, include_sparse=include_sparse,
+        sample_key_map=key_map,
+    )
     return {
         "entity_id": entity_id,
         "entity_name": entity_name,

@@ -29,6 +29,14 @@ export function toastCollectionUpdated() {
   uiModule.showToast('Collection updated.', CHECK);
 }
 
+export function toastClusterCreated() {
+  uiModule.showToast('Cluster ringfenced.', CHECK);
+}
+
+export function toastClusterUpdated() {
+  uiModule.showToast('Cluster updated.', CHECK);
+}
+
 export function toastConnectionLocked() {
   uiModule.showToast('Connection locked in.', CHECK);
 }
@@ -105,4 +113,20 @@ export function toastDocumentDeleted() {
 
 export function toastDocumentsDeleted(n) {
   uiModule.showToast(`Deleted ${n} document${n === 1 ? '' : 's'}.`, CHECK);
+}
+
+export function toastWorldExported(entityCount, docCount) {
+  uiModule.showToast(
+    `Exported ${entityCount} collection${entityCount === 1 ? '' : 's'}, ${docCount} document${docCount === 1 ? '' : 's'}.`,
+    CHECK,
+  );
+}
+
+export function toastWorldImported(result) {
+  const created = result?.entities_created || 0;
+  const rows = (result?.rows_inserted || 0) + (result?.rows_updated || 0);
+  uiModule.showToast(
+    `World imported — ${created} new collection${created === 1 ? '' : 's'}, ${rows} row${rows === 1 ? '' : 's'} synced.`,
+    CHECK,
+  );
 }

@@ -25,6 +25,7 @@ let _filter = {};
 let _viewMode = 'list';
 let _cachedDocs = [];
 let _cachedFields = [];
+let _sampleDocument = null;
 let _totalDocs = 0;
 let _fetchOffset = 0;
 let _loading = false;
@@ -259,15 +260,17 @@ async function _loadSchema(sidebar) {
   try {
     const schema = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/schema`);
     _cachedFields = schema.fields || [];
+    _sampleDocument = schema.sample_document || null;
     sidebar.innerHTML = `
       <div class="atlas-compass-schema-title">Schema</div>
       <div class="atlas-compass-schema-count">${schema.document_count} documents</div>
       ${(_cachedFields).map(f => `
-        <div class="atlas-schema-field" data-field="${_esc(f.slug)}" title="Click to filter">
+        <div class="atlas-schema-field" data-field="${_esc(f.slug)}" data-sample-key="${_esc(f.sample_key || f.slug)}" title="Click to filter">
           <span class="atlas-schema-field-name">${_esc(f.slug)}</span>
           <span class="atlas-schema-field-type">${_esc(f.inferred_type)}</span>
         </div>`).join('') || '<div class="atlas-empty">No fields yet</div>'}
     `;
+    if (_viewMode === 'table') _renderDocs(false);
   } catch (e) {
     sidebar.innerHTML = `<div class="atlas-empty">${_esc(e.message)}</div>`;
   }
@@ -426,7 +429,8 @@ function _wire() {
     if (!field || !filterInput) return;
     let obj = {};
     try { obj = JSON.parse(filterInput.value.trim() || '{}'); } catch { obj = {}; }
-    obj[field.dataset.field] = '';
+    const filterKey = field.dataset.sampleKey || field.dataset.field;
+    obj[filterKey] = '';
     filterInput.value = JSON.stringify(obj);
     _updateFilterValidity();
   });
