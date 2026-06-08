@@ -44,6 +44,10 @@ docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs 
 docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev down   # stops dev only
 ```
 
+Forgot the dev-stack admin password? See **Forgot admin password?** in
+[README.md](README.md#forgot-admin-password) (patch `data-dev/auth.json` via
+`docker compose … exec odysseus`, then restart the container).
+
 Manual development uses Python 3.11+:
 
 ```bash

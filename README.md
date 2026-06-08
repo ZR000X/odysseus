@@ -108,11 +108,63 @@ PowerShell:
 docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs odysseus | Select-String -Pattern password
 ```
 
-If you missed the one-time log line, set `ODYSSEUS_ADMIN_PASSWORD` in `.env.dev`,
-delete `data-dev/auth.json`, and recreate the dev container. With that env var
-set, setup uses your password and does not print it in logs.
+If you missed the one-time log line, see [Forgot admin password?](#forgot-admin-password)
+below.
 
 GPU on dev: add `-f docker/gpu.nvidia.yml` (or `gpu.amd.yml`) after `docker/dev.yml` (see `.env.dev.example`).
+
+#### Forgot admin password?
+
+Passwords are stored as bcrypt hashes in `data/auth.json` (production) or
+`data-dev/auth.json` (parallel dev stack). **There is no command to read the
+original password back** — you can only reset it.
+
+The one-time `Temporary password:` log line appears **only when `auth.json` is
+first created**. If that file already exists, startup logs say
+`auth.json already exists` and no password is printed.
+
+**Option A — recreate admin via env (keeps other data):**
+
+1. Set `ODYSSEUS_ADMIN_PASSWORD=your_new_password` in `.env` (production) or
+   `.env.dev` (dev stack).
+2. Delete the auth file on the host: `data/auth.json` or `data-dev/auth.json`.
+3. Recreate the Odysseus container (add dev `-f` / `--env-file` flags if needed):
+   ```bash
+   docker compose up -d --force-recreate odysseus
+   # dev stack:
+   docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --force-recreate odysseus
+   ```
+
+**Option B — patch hash in the running container (fast break-glass):**
+
+Replace `YOUR_NEW_PASSWORD` below. Use the compose flags that match your stack.
+
+```bash
+# Production (default project, auth at ./data/auth.json)
+docker compose exec odysseus python -c "import json, bcrypt; p='/app/data/auth.json'; d=json.load(open(p)); u='admin'; d['users'][u]['password_hash']=bcrypt.hashpw(b'YOUR_NEW_PASSWORD', bcrypt.gensalt()).decode(); json.dump(d, open(p,'w'), indent=2)"
+docker compose restart odysseus
+
+# Parallel dev stack (auth at ./data-dev/auth.json)
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev exec odysseus python -c "import json, bcrypt; p='/app/data/auth.json'; d=json.load(open(p)); u='admin'; d['users'][u]['password_hash']=bcrypt.hashpw(b'YOUR_NEW_PASSWORD', bcrypt.gensalt()).decode(); json.dump(d, open(p,'w'), indent=2)"
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev restart odysseus
+```
+
+PowerShell is the same commands; only the log-grep examples above use
+`Select-String` instead of `grep`.
+
+**Important:** after Option B you **must restart** the Odysseus container.
+The app loads `auth.json` into memory at startup; editing the file on disk
+alone does not update the running process until restart.
+
+If the username is not `admin`, list accounts first:
+
+```bash
+docker compose exec odysseus python -c "import json; print(list(json.load(open('/app/data/auth.json'))['users'].keys()))"
+```
+
+(`docker ps` shows container names like `odysseus-odysseus-1` or
+`odysseus-dev-odysseus-1`; prefer the `docker compose exec odysseus` form
+above so Compose resolves the right container for your project.)
 
 ### Native Linux / macOS
 ```bash
