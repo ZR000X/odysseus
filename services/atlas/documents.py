@@ -44,6 +44,34 @@ def _strip_system_keys(doc: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in doc.items() if k not in SYSTEM_KEYS}
 
 
+def _normalize_mongo_id(val: Any) -> Any:
+    if isinstance(val, dict) and "$oid" in val:
+        return str(val["$oid"])
+    return val
+
+
+def _prepare_insert_data(document: Dict[str, Any]) -> Dict[str, Any]:
+    data = {
+        k: v for k, v in document.items()
+        if k not in ("_atlas_row_id", "_atlas_created_at", "_atlas_updated_at")
+    }
+    if "_id" in document:
+        data["_id"] = _normalize_mongo_id(document["_id"])
+    else:
+        data.pop("_id", None)
+    return data
+
+
+def _id_exists_in_table(conn, table: str, external_id: Any) -> bool:
+    norm = _normalize_mongo_id(external_id)
+    row = conn.execute(
+        f"SELECT 1 FROM {_quote_ident(table)} WHERE "
+        f"json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ? LIMIT 1",
+        (norm, json.dumps(norm)),
+    ).fetchone()
+    return row is not None
+
+
 def _apply_update(existing: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(existing)
     has_operator = any(k.startswith("$") for k in update)
@@ -137,8 +165,10 @@ def insert_one(
     entity = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)
     table = entity["table_name"]
-    data = _strip_system_keys(document)
+    data = _prepare_insert_data(document)
     with open_world_db(world["db_path"]) as conn:
+        if "_id" in data and _id_exists_in_table(conn, table, data["_id"]):
+            raise ValueError(f"Duplicate _id: {data['_id']}")
         cur = conn.execute(
             f"INSERT INTO {_quote_ident(table)} (data) VALUES (?)",
             (json.dumps(data),),
@@ -164,11 +194,44 @@ def insert_many(
     entity_id: str,
     documents: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    ids = []
-    for doc in documents:
-        r = insert_one(owner, world_id, entity_id, doc)
-        ids.append(r["inserted_id"])
-    return {"inserted_ids": ids, "inserted_count": len(ids)}
+    entity = get_entity(owner, world_id, entity_id)
+    world = get_world(owner, world_id)
+    table = entity["table_name"]
+    ids: List[int] = []
+    errors: List[Dict[str, Any]] = []
+    inserted_count = 0
+
+    with open_world_db(world["db_path"]) as conn:
+        for i, document in enumerate(documents):
+            try:
+                data = _prepare_insert_data(document)
+                if "_id" in data and _id_exists_in_table(conn, table, data["_id"]):
+                    errors.append({"index": i, "message": f"Duplicate _id: {data['_id']}"})
+                    continue
+                cur = conn.execute(
+                    f"INSERT INTO {_quote_ident(table)} (data) VALUES (?)",
+                    (json.dumps(data),),
+                )
+                row_id = cur.lastrowid
+                ids.append(row_id)
+                inserted_count += 1
+                infer_fields_from_document(conn, entity_id, data)
+            except Exception as e:
+                errors.append({"index": i, "message": str(e)})
+
+        if inserted_count:
+            conn.execute(
+                "UPDATE atlas_entities SET row_count = row_count + ?, updated_at = datetime('now') WHERE id = ?",
+                (inserted_count, entity_id),
+            )
+
+    if inserted_count:
+        refresh_world_stats(owner, world_id)
+
+    result: Dict[str, Any] = {"inserted_ids": ids, "inserted_count": inserted_count}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def update_one(

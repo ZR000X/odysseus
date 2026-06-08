@@ -102,6 +102,8 @@ class RelationshipUpdate(BaseModel):
     label: Optional[str] = None
     from_anchor: Optional[str] = None
     to_anchor: Optional[str] = None
+    from_entity_id: Optional[str] = None
+    to_entity_id: Optional[str] = None
 
 
 def _owner(request: Request) -> Optional[str]:

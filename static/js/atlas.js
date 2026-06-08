@@ -56,9 +56,16 @@ function _playViewEnter(main, className) {
   setTimeout(() => main.classList.remove(className), VIEW_TRANSITION_MS);
 }
 
+function _setViewMode(mode) {
+  document.body.classList.remove('atlas-canvas-mode', 'atlas-compass-mode');
+  if (mode === 'canvas') document.body.classList.add('atlas-canvas-mode');
+  else if (mode === 'compass') document.body.classList.add('atlas-compass-mode');
+}
+
 function _showCanvas() {
   _view = 'canvas';
   _compassEntityId = null;
+  _setViewMode('canvas');
   const main = document.getElementById('atlas-main');
   if (!main) return;
   unmountCompass();
@@ -80,6 +87,7 @@ function _showCanvas() {
 
 function _showCompass(entityId, entityName) {
   _view = 'compass';
+  _setViewMode('compass');
   _compassEntityId = entityId;
   _compassEntityName = entityName;
   const entity = _entities.find(e => e.id === entityId) || {
@@ -163,7 +171,7 @@ export function closePanel() {
   unmountCompass();
   document.getElementById('atlas-backdrop')?.remove();
   document.getElementById('tool-atlas-btn')?.classList.remove('active');
-  document.body.classList.remove('atlas-view');
+  document.body.classList.remove('atlas-view', 'atlas-canvas-mode', 'atlas-compass-mode');
 }
 
 export function togglePanel() {

@@ -45,8 +45,13 @@ export function toastImportedCsv(inserted, failed) {
   uiModule.showToast(`Imported ${inserted} rows${failed ? ` (${failed} failed)` : ''}. Absolute unit.`, CHECK);
 }
 
-export function toastImportedJson(n) {
-  uiModule.showToast(`Imported ${n} doc${n === 1 ? '' : 's'}. Big brain.`, CHECK);
+export function toastImportedJson(n, failed = 0) {
+  const failNote = failed ? ` (${failed} failed)` : '';
+  uiModule.showToast(`Imported ${n} doc${n === 1 ? '' : 's'}${failNote}. Big brain.`, CHECK);
+}
+
+export function toastImporting(label = 'Importing…') {
+  uiModule.showToast(label, { leadingIcon: 'spinner', autoHide: false });
 }
 
 export function toastDocumentAdded() {
@@ -96,4 +101,8 @@ export function toastDocumentUpdated() {
 
 export function toastDocumentDeleted() {
   uiModule.showToast('Document deleted.', CHECK);
+}
+
+export function toastDocumentsDeleted(n) {
+  uiModule.showToast(`Deleted ${n} document${n === 1 ? '' : 's'}.`, CHECK);
 }

@@ -85,6 +85,13 @@ def create_relationship(
     return get_relationship(owner, world_id, rel_id)
 
 
+def _entity_exists(conn, entity_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM atlas_entities WHERE id = ?", (entity_id,)
+    ).fetchone()
+    return row is not None
+
+
 def update_relationship(
     owner: Optional[str],
     world_id: str,
@@ -96,6 +103,7 @@ def update_relationship(
     allowed = {
         "rel_type", "from_field", "to_field", "label",
         "from_anchor", "to_anchor",
+        "from_entity_id", "to_entity_id",
     }
     sets = []
     vals = []
@@ -105,10 +113,25 @@ def update_relationship(
             vals.append(v)
     if not sets:
         return get_relationship(owner, world_id, rel_id)
-    sets.append("updated_at = ?")
-    vals.append(now)
-    vals.append(rel_id)
+
     with open_world_db(world["db_path"]) as conn:
+        current = conn.execute(
+            "SELECT * FROM atlas_relationships WHERE id = ?", (rel_id,)
+        ).fetchone()
+        if not current:
+            raise AtlasNotFoundError(f"Relationship not found: {rel_id}")
+
+        new_from = kwargs.get("from_entity_id", current["from_entity_id"])
+        new_to = kwargs.get("to_entity_id", current["to_entity_id"])
+        if new_from == new_to:
+            raise ValueError("from_entity_id and to_entity_id must differ")
+        for eid in (new_from, new_to):
+            if not _entity_exists(conn, eid):
+                raise ValueError(f"Entity not found: {eid}")
+
+        sets.append("updated_at = ?")
+        vals.append(now)
+        vals.append(rel_id)
         cur = conn.execute(
             f"UPDATE atlas_relationships SET {', '.join(sets)} WHERE id = ?",
             vals,

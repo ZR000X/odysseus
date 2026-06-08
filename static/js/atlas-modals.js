@@ -8,20 +8,22 @@ function _esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function _modal(title, bodyHtml, onSubmit, { submitLabel = 'Create' } = {}) {
+function _modal(title, bodyHtml, onSubmit, { submitLabel = 'Create', modalClass = '', minHeight } = {}) {
+  const contentCls = ['modal-content', 'atlas-modal-content', modalClass].filter(Boolean).join(' ');
+  const widthStyle = modalClass === 'atlas-doc-modal' ? '' : ' style="max-width:420px"';
   return new Promise((resolve) => {
     const wrap = document.createElement('div');
     wrap.className = 'modal atlas-modal';
     wrap.innerHTML = `
-      <div class="modal-content atlas-modal-content" style="max-width:420px">
+      <div class="${contentCls}"${widthStyle}>
         <div class="modal-header">
           <h4>${_esc(title)}</h4>
           <button type="button" class="close-btn atlas-modal-close" aria-label="Close">✕</button>
         </div>
         <div class="modal-body atlas-modal-body">${bodyHtml}</div>
-        <div class="modal-footer atlas-modal-footer" style="display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;border-top:1px solid var(--border)">
+        <div class="modal-footer atlas-modal-footer">
           <button type="button" class="admin-btn-sm atlas-modal-cancel">Cancel</button>
-          <button type="button" class="admin-btn-sm atlas-modal-submit" style="background:var(--accent);color:var(--bg)">${_esc(submitLabel)}</button>
+          <button type="button" class="admin-btn-sm atlas-modal-submit">${_esc(submitLabel)}</button>
         </div>
       </div>`;
     const close = (val) => { wrap.remove(); resolve(val); };
@@ -45,6 +47,7 @@ function _modal(title, bodyHtml, onSubmit, { submitLabel = 'Create' } = {}) {
         header,
         skipSelector: 'button, input, select, textarea, label',
         enableDock: true,
+        minHeight,
       });
     }
     const first = wrap.querySelector('input, select, textarea');
@@ -128,10 +131,77 @@ export function promptRelationship(entities, fromId = '', toId = '', anchors = {
   );
 }
 
+export function promptEditRelationship(rel, entities) {
+  const opts = entities.map(e =>
+    `<option value="${_esc(e.id)}"${e.id === rel.from_entity_id ? ' selected' : ''}>${_esc(e.name)}</option>`
+  ).join('');
+  const toOpts = entities.map(e =>
+    `<option value="${_esc(e.id)}"${e.id === rel.to_entity_id ? ' selected' : ''}>${_esc(e.name)}</option>`
+  ).join('');
+  const type = rel.rel_type || 'one_to_many';
+  const bodyHtml = `<label class="atlas-form-label">From<select class="atlas-form-input" id="atlas-rel-from" disabled>${opts}</select></label>
+     <label class="atlas-form-label">To<select class="atlas-form-input" id="atlas-rel-to" disabled>${toOpts}</select></label>
+     <label class="atlas-form-label">Type<select class="atlas-form-input" id="atlas-rel-type">
+       <option value="one_to_many"${type === 'one_to_many' ? ' selected' : ''}>One to many</option>
+       <option value="one_to_one"${type === 'one_to_one' ? ' selected' : ''}>One to one</option>
+       <option value="many_to_many"${type === 'many_to_many' ? ' selected' : ''}>Many to many</option>
+     </select></label>
+     <label class="atlas-form-label">From field <span class="atlas-filter-hint">(optional)</span><input class="atlas-form-input" id="atlas-rel-from-field" value="${_esc(rel.from_field || '')}" placeholder="Inferred from data" /></label>
+     <label class="atlas-form-label">To field <span class="atlas-filter-hint">(optional)</span><input class="atlas-form-input" id="atlas-rel-to-field" value="${_esc(rel.to_field || '')}" placeholder="Inferred from data" /></label>
+     <label class="atlas-form-label">Label<input class="atlas-form-input" id="atlas-rel-label" value="${_esc(rel.label || '')}" placeholder="Optional" /></label>`;
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal atlas-modal';
+    wrap.innerHTML = `
+      <div class="modal-content atlas-modal-content" style="max-width:420px">
+        <div class="modal-header">
+          <h4>Edit Relationship</h4>
+          <button type="button" class="close-btn atlas-modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body atlas-modal-body">${bodyHtml}</div>
+        <div class="modal-footer atlas-modal-footer" style="justify-content:space-between">
+          <button type="button" class="admin-btn-sm atlas-rel-delete" style="color:#dc2626">Delete</button>
+          <div style="display:flex;gap:8px">
+            <button type="button" class="admin-btn-sm atlas-modal-cancel">Cancel</button>
+            <button type="button" class="admin-btn-sm atlas-modal-submit">Save</button>
+          </div>
+        </div>
+      </div>`;
+    const close = (val) => { wrap.remove(); resolve(val); };
+    wrap.querySelector('.atlas-modal-close')?.addEventListener('click', () => close(null));
+    wrap.querySelector('.atlas-modal-cancel')?.addEventListener('click', () => close(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) close(null); });
+    wrap.querySelector('.atlas-rel-delete')?.addEventListener('click', async () => {
+      const ok = await uiModule.styledConfirm('Delete this relationship?', { confirmText: 'Delete', danger: true });
+      if (ok) close({ _delete: true });
+    });
+    wrap.querySelector('.atlas-modal-submit')?.addEventListener('click', () => {
+      close({
+        rel_type: wrap.querySelector('#atlas-rel-type')?.value,
+        from_field: wrap.querySelector('#atlas-rel-from-field')?.value?.trim() || '',
+        to_field: wrap.querySelector('#atlas-rel-to-field')?.value?.trim() || '',
+        label: wrap.querySelector('#atlas-rel-label')?.value?.trim() || '',
+      });
+    });
+    document.body.appendChild(wrap);
+    const content = wrap.querySelector('.modal-content');
+    const header = wrap.querySelector('.modal-header');
+    if (content && header) {
+      makeWindowDraggable(wrap, {
+        content,
+        header,
+        skipSelector: 'button, input, select, textarea, label',
+        enableDock: true,
+      });
+    }
+    wrap.querySelector('#atlas-rel-label')?.focus();
+  });
+}
+
 export function promptAddDocument() {
   return _modal(
     'Add Document',
-    `<label class="atlas-form-label">Document JSON<textarea class="atlas-form-input" id="atlas-doc-json" rows="8" placeholder='{"name": "Alice", "email": "a@example.com"}' style="font-family:ui-monospace,monospace;font-size:11px"></textarea></label>
+    `<label class="atlas-form-label">Document JSON<textarea class="atlas-form-input atlas-doc-json" id="atlas-doc-json" rows="8" placeholder='{"name": "Alice", "email": "a@example.com"}'></textarea></label>
      <p class="atlas-form-hint">Paste a JSON object. An _id is assigned automatically.</p>`,
     (wrap) => {
       const raw = wrap.querySelector('#atlas-doc-json')?.value?.trim();
@@ -143,15 +213,59 @@ export function promptAddDocument() {
       }
       return { document: doc };
     },
-    { submitLabel: 'Insert' },
+    { submitLabel: 'Insert', modalClass: 'atlas-doc-modal', minHeight: 440 },
   );
+}
+
+function _normalizeMongoId(val) {
+  if (val && typeof val === 'object' && !Array.isArray(val) && val.$oid) {
+    return String(val.$oid);
+  }
+  return val;
+}
+
+function _normalizeImportDoc(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return doc;
+  if (!Object.prototype.hasOwnProperty.call(doc, '_id')) return doc;
+  return { ...doc, _id: _normalizeMongoId(doc._id) };
+}
+
+export function normalizeImportDocuments(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) throw new Error('JSON is required');
+
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    const lines = trimmed.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length > 1) {
+      return lines
+        .map((l) => _normalizeImportDoc(JSON.parse(l)))
+        .filter((d) => d && typeof d === 'object' && !Array.isArray(d));
+    }
+    throw new Error('Invalid JSON');
+  }
+
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map(_normalizeImportDoc)
+      .filter((d) => d && typeof d === 'object' && !Array.isArray(d));
+  }
+  if (parsed && typeof parsed === 'object') {
+    if (Array.isArray(parsed.documents)) {
+      return normalizeImportDocuments(JSON.stringify(parsed.documents));
+    }
+    return [_normalizeImportDoc(parsed)];
+  }
+  throw new Error('Invalid JSON');
 }
 
 export function promptImportJson() {
   return _modal(
     'Import JSON',
-    `<label class="atlas-form-label">JSON array<textarea class="atlas-form-input" id="atlas-import-json" rows="10" placeholder='[{"name":"Alice"},{"name":"Bob"}]' style="font-family:ui-monospace,monospace;font-size:11px"></textarea></label>
-     <p class="atlas-form-hint">Paste a JSON array of objects, or choose a file below.</p>
+    `<label class="atlas-form-label">JSON<textarea class="atlas-form-input atlas-doc-json" id="atlas-import-json" rows="10" placeholder='[{"name":"Alice"},{"name":"Bob"}]'></textarea></label>
+     <p class="atlas-form-hint">Paste a JSON array, a single object, or NDJSON (one object per line). MongoDB <code>_id</code> values are preserved. Or choose a file below.</p>
      <label class="atlas-form-label" style="margin-top:8px">Or pick a file<input type="file" class="atlas-form-input" id="atlas-import-file" accept=".json,application/json" /></label>`,
     async (wrap) => {
       const fileInput = wrap.querySelector('#atlas-import-file');
@@ -166,12 +280,9 @@ export function promptImportJson() {
         });
       }
       if (!raw) throw new Error('JSON is required');
-      let docs;
-      try { docs = JSON.parse(raw); } catch { throw new Error('Invalid JSON'); }
-      if (!Array.isArray(docs)) throw new Error('JSON must be an array of objects');
-      return { documents: docs };
+      return { raw };
     },
-    { submitLabel: 'Import' },
+    { submitLabel: 'Import', modalClass: 'atlas-doc-modal', minHeight: 440 },
   );
 }
 
@@ -191,9 +302,9 @@ export function promptTypeToConfirm(expectedName, message) {
             <input type="text" class="atlas-form-input" id="atlas-type-confirm" autocomplete="off" />
           </label>
         </div>
-        <div class="modal-footer atlas-modal-footer" style="display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;border-top:1px solid var(--border)">
+        <div class="modal-footer atlas-modal-footer">
           <button type="button" class="admin-btn-sm atlas-modal-cancel">Cancel</button>
-          <button type="button" class="admin-btn-sm atlas-modal-submit atlas-delete-confirm" disabled style="background:#dc2626;color:#fff">Delete</button>
+          <button type="button" class="admin-btn-sm atlas-modal-submit atlas-delete-confirm" disabled>Delete</button>
         </div>
       </div>`;
     const close = (val) => { wrap.remove(); resolve(val); };
@@ -223,7 +334,7 @@ export function promptEditDocument(doc) {
   const raw = JSON.stringify(_docForEdit(doc), null, 2);
   return _modal(
     'Edit Document',
-    `<label class="atlas-form-label">Document JSON<textarea class="atlas-form-input" id="atlas-doc-json" rows="14" style="font-family:ui-monospace,monospace;font-size:11px">${_esc(raw)}</textarea></label>`,
+    `<label class="atlas-form-label">Document JSON<textarea class="atlas-form-input atlas-doc-json" id="atlas-doc-json" rows="14">${_esc(raw)}</textarea></label>`,
     (wrap) => {
       const text = wrap.querySelector('#atlas-doc-json')?.value?.trim();
       if (!text) throw new Error('Document JSON is required');
@@ -234,7 +345,7 @@ export function promptEditDocument(doc) {
       }
       return { document: parsed, docId: doc._id ?? doc._atlas_row_id };
     },
-    { submitLabel: 'Save' },
+    { submitLabel: 'Save', modalClass: 'atlas-doc-modal', minHeight: 440 },
   );
 }
 

@@ -15,9 +15,10 @@ Atlas is Odysseus's MongoDB-style document store: **worlds** of **collections** 
 ## Using the UI
 
 1. Open **Atlas** from the sidebar (Tools).
-2. **Canvas view** — pan/zoom, drag collection cards, connect relationships. Double-click empty space to create a collection; double-click a card to browse documents.
+2. **Canvas view** — pan/zoom, drag collection cards, connect relationships. Drag from a collection port to another to create a relationship, or drag an **edge endpoint** (circle at either end) to reconnect it to a different port. Double-click empty space to create a collection; double-click a card to browse documents.
 3. **Compass view** — filter documents with JSON, browse schema, view collapsible JSON cards.
-4. Background animations from chat remain visible (transparent canvas).
+4. **Background animations** — the same theme background effects as chat (synapse, rain, sparkles, etc.) show through the canvas graph area; Compass uses a lighter frosted overlay. Change the effect in **Settings → Theme → Background / Effect**.
+5. **Cardinality symbols** — ER notation at each relationship end: `|` = one, crow's foot = many. `one_to_many` shows one on the from side and many on the to side; `one_to_one` shows one at both ends; `many_to_many` shows many at both ends.
 
 Deep link: `/atlas`
 

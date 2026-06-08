@@ -28,8 +28,17 @@ def compile_filter(filter_obj: Optional[Dict[str, Any]] = None) -> Tuple[str, Li
 
     for key, val in filter_obj.items():
         if key in ("_id", "_atlas_row_id"):
-            clauses.append("_atlas_row_id = ?")
-            params.append(int(val))
+            if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
+                n = int(val)
+                clauses.append(
+                    "(_atlas_row_id = ? OR json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ?)"
+                )
+                params.extend([n, n, val])
+            else:
+                clauses.append(
+                    "(json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ?)"
+                )
+                params.extend([val, json.dumps(val)])
         elif key.startswith("$"):
             raise ValueError(f"Unsupported filter operator at top level: {key}")
         else:

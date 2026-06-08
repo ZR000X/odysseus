@@ -60,6 +60,7 @@ export function renderJsonView(docs) {
         <div class="atlas-json-header-actions">
           <button type="button" class="admin-btn-sm atlas-json-edit">Edit</button>
           <button type="button" class="admin-btn-sm atlas-json-copy">Copy</button>
+          <button type="button" class="admin-btn-sm atlas-json-delete atlas-doc-delete" title="Delete">✕</button>
         </div>
       </div>
       <textarea class="atlas-json-raw" readonly hidden>${_esc(raw)}</textarea>

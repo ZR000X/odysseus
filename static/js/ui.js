@@ -304,7 +304,7 @@ export function showToast(msg, durationOrOpts) {
   toastEl.textContent = '';
   toastEl.classList.remove('error');
 
-  let duration = 1200, actionLabel = null, onAction = null, actionHint = null, actionIcon = null, leadingIcon = null;
+  let duration = 1200, actionLabel = null, onAction = null, actionHint = null, actionIcon = null, leadingIcon = null, autoHide = true;
   if (typeof durationOrOpts === 'object' && durationOrOpts) {
     duration = durationOrOpts.duration || 5000;
     actionLabel = durationOrOpts.action;
@@ -312,6 +312,7 @@ export function showToast(msg, durationOrOpts) {
     actionHint = durationOrOpts.actionHint || null;
     actionIcon = durationOrOpts.actionIcon || null;
     leadingIcon = durationOrOpts.leadingIcon || null;
+    if (durationOrOpts.autoHide === false) autoHide = false;
   } else if (typeof durationOrOpts === 'number') {
     duration = durationOrOpts;
   }
@@ -397,26 +398,28 @@ export function showToast(msg, durationOrOpts) {
     toastEl.style.pointerEvents = '';
   }
 
-  // Pin to top-right via CSS — clear any legacy inline overrides so the
+  // Pin to bottom-right via CSS — clear any legacy inline overrides so the
   // slide-in-from-right / slide-out-to-left transition can run cleanly.
   toastEl.style.left = '';
   toastEl.style.transform = '';
   toastEl.classList.remove('exiting');
   toastEl.classList.add('show');
   clearTimeout(toastEl._hideTimer);
-  toastEl._hideTimer = setTimeout(() => {
-    // Add `exiting` so the CSS rule slides it off to the LEFT instead of
-    // back to the right (where it came from). We piggyback on the same
-    // .toast base; .exiting overrides the resting transform.
-    toastEl.classList.add('exiting');
-    toastEl.classList.remove('show');
-    // Reset pointer-events so an action-toast (which sets it to 'auto'
-    // for its clickable button) doesn't leave the toast intercepting
-    // clicks after it's slid away. Was previously only cleared on the
-    // NEXT plain toast, so a lingering action-toast could appear to
-    // "lock" interaction near the top-right.
-    toastEl.style.pointerEvents = '';
-  }, duration);
+  if (autoHide) {
+    toastEl._hideTimer = setTimeout(() => {
+      // Add `exiting` so the CSS rule slides it off to the LEFT instead of
+      // back to the right (where it came from). We piggyback on the same
+      // .toast base; .exiting overrides the resting transform.
+      toastEl.classList.add('exiting');
+      toastEl.classList.remove('show');
+      // Reset pointer-events so an action-toast (which sets it to 'auto'
+      // for its clickable button) doesn't leave the toast intercepting
+      // clicks after it's slid away. Was previously only cleared on the
+      // NEXT plain toast, so a lingering action-toast could appear to
+      // "lock" interaction near the bottom-right.
+      toastEl.style.pointerEvents = '';
+    }, duration);
+  }
 }
 
 /**

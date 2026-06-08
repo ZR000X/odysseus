@@ -73,16 +73,23 @@ def import_rows(
         stats["rows_total"] += 1
         row_data = {
             k: v for k, v in raw.items()
-            if k and k not in ("_atlas_row_id", "_id")
+            if k and k not in ("_atlas_row_id",)
         }
         row_id_raw = (raw.get("_atlas_row_id") or raw.get("_id") or "").strip()
+        if row_id_raw and "_id" not in row_data:
+            row_data["_id"] = int(row_id_raw) if row_id_raw.isdigit() else row_id_raw
         try:
-            if mode == "merge" and row_id_raw.isdigit():
-                atlas_documents.update_one(
+            if mode == "merge" and row_id_raw:
+                filter_id = int(row_id_raw) if row_id_raw.isdigit() else row_id_raw
+                result = atlas_documents.update_one(
                     owner, world_id, entity_id,
-                    {"_id": int(row_id_raw)}, row_data,
+                    {"_id": filter_id}, row_data,
                 )
-                stats["rows_updated"] += 1
+                if result.get("modified_count") or result.get("matched_count"):
+                    stats["rows_updated"] += 1
+                else:
+                    atlas_documents.insert_one(owner, world_id, entity_id, row_data)
+                    stats["rows_inserted"] += 1
                 continue
             if row_data or mode == "append":
                 atlas_documents.insert_one(owner, world_id, entity_id, row_data)

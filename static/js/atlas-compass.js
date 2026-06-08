@@ -7,11 +7,11 @@ import {
   renderListView, renderJsonView, renderTableView,
   wireScrollDelegation, expandAllChevrons,
 } from './atlas-compass-views.js';
-import { promptAddDocument, promptImportJson, promptEditDocument } from './atlas-modals.js';
+import { promptAddDocument, promptImportJson, promptEditDocument, normalizeImportDocuments } from './atlas-modals.js';
 import {
   toastFilterMatch, toastImportedCsv, toastImportedJson, toastDocumentAdded,
   toastCsvExported, toastRefreshed, toastBackOnMap, toastViewMode, toastAllLoaded,
-  toastCopied, toastDocumentUpdated, toastDocumentDeleted,
+  toastCopied, toastDocumentUpdated, toastDocumentDeleted, toastDocumentsDeleted, toastImporting,
 } from './atlas-toast.js';
 
 const API_BASE = window.location.origin;
@@ -61,6 +61,17 @@ function _docById(docId) {
   return _cachedDocs.find(d => String(d._id ?? d._atlas_row_id) === id);
 }
 
+function _setImportBusy(busy) {
+  for (const sel of ['#atlas-compass-import-csv', '#atlas-compass-import-json']) {
+    const btn = _container?.querySelector(sel);
+    if (btn) btn.disabled = busy;
+  }
+}
+
+function _yieldToPaint() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
 function _pickCsvFile() {
   return new Promise((resolve) => {
     const input = document.createElement('input');
@@ -82,6 +93,20 @@ function _updateMeta() {
   const meta = _container?.querySelector('#atlas-compass-meta');
   if (!meta) return;
   meta.textContent = `Showing ${_cachedDocs.length} of ${_totalDocs} document${_totalDocs === 1 ? '' : 's'}`;
+  _updateDeleteManyBtn();
+}
+
+function _updateDeleteManyBtn() {
+  const btn = _container?.querySelector('#atlas-compass-delete-many');
+  if (!btn) return;
+  const n = _totalDocs;
+  if (n > 0) {
+    btn.hidden = false;
+    btn.textContent = `Delete ${n} matching`;
+    btn.title = `Delete ${n} document${n === 1 ? '' : 's'} matching this filter`;
+  } else {
+    btn.hidden = true;
+  }
 }
 
 function _getScrollEl() {
@@ -296,6 +321,32 @@ async function _deleteDocument(docId) {
   }
 }
 
+async function _deleteMatching() {
+  const n = _totalDocs;
+  if (n <= 0) return;
+  const ok = await uiModule.styledConfirm(
+    `Delete ${n} document${n === 1 ? '' : 's'} matching this filter? This cannot be undone.`,
+    { confirmText: 'Delete', danger: true },
+  );
+  if (!ok) return;
+  const btn = _container?.querySelector('#atlas-compass-delete-many');
+  if (btn) btn.disabled = true;
+  try {
+    const result = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/deleteMany`, {
+      method: 'POST',
+      body: JSON.stringify({ filter: _filter, confirm: true }),
+    });
+    toastDocumentsDeleted(result.deleted_count ?? n);
+    await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+    _getScrollEl()?.scrollTo(0, 0);
+    await _fetchPage(false);
+  } catch (e) {
+    uiModule.showError(e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function _wireScrollActions() {
   const scroll = _getScrollEl();
   wireScrollDelegation(scroll, {
@@ -368,6 +419,7 @@ function _wire() {
   });
 
   _container?.querySelector('#atlas-compass-apply')?.addEventListener('click', () => _applyFilter());
+  _container?.querySelector('#atlas-compass-delete-many')?.addEventListener('click', () => _deleteMatching());
 
   _container?.querySelector('#atlas-compass-schema')?.addEventListener('click', (e) => {
     const field = e.target.closest('.atlas-schema-field');
@@ -390,7 +442,10 @@ function _wire() {
   _container?.querySelector('#atlas-compass-import-csv')?.addEventListener('click', async () => {
     const csv = await _pickCsvFile();
     if (!csv) return;
+    _setImportBusy(true);
+    toastImporting('Importing CSV…');
     try {
+      await _yieldToPaint();
       const stats = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/import`, {
         method: 'POST', body: JSON.stringify({ mode: 'append', csv }),
       });
@@ -398,21 +453,35 @@ function _wire() {
       await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
       _getScrollEl()?.scrollTo(0, 0);
       await _fetchPage(false);
-    } catch (e) { uiModule.showError(e.message); }
+    } catch (e) {
+      uiModule.showError(e.message);
+    } finally {
+      _setImportBusy(false);
+    }
   });
 
   _container?.querySelector('#atlas-compass-import-json')?.addEventListener('click', async () => {
     const data = await promptImportJson();
-    if (!data?.documents?.length) return;
+    if (!data?.raw) return;
+    _setImportBusy(true);
+    toastImporting('Importing JSON…');
     try {
+      await _yieldToPaint();
+      const documents = normalizeImportDocuments(data.raw);
+      if (!documents.length) return;
       const result = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/insertMany`, {
-        method: 'POST', body: JSON.stringify({ documents: data.documents }),
+        method: 'POST', body: JSON.stringify({ documents }),
       });
-      toastImportedJson(result.inserted_count ?? data.documents.length);
+      const failed = result.errors?.length || 0;
+      toastImportedJson(result.inserted_count ?? documents.length, failed);
       await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
       _getScrollEl()?.scrollTo(0, 0);
       await _fetchPage(false);
-    } catch (e) { uiModule.showError(e.message); }
+    } catch (e) {
+      uiModule.showError(e.message);
+    } finally {
+      _setImportBusy(false);
+    }
   });
 
   _container?.querySelector('#atlas-compass-add-doc')?.addEventListener('click', async () => {
@@ -473,6 +542,7 @@ export function mountCompass(container, {
           <label>Filter <span class="atlas-filter-hint">JSON · Enter to apply</span></label>
           <textarea id="atlas-compass-filter" class="atlas-compass-filter-input" rows="2">{}</textarea>
           <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-apply">Find</button>
+          <button type="button" class="admin-btn-sm admin-btn-delete atlas-btn-press" id="atlas-compass-delete-many" hidden>Delete matching</button>
         </div>
         <div class="atlas-compass-view-bar">
           <div class="atlas-view-tabs">
