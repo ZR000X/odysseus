@@ -84,20 +84,33 @@ def infer_fields_from_document(conn, entity_id: str, document: Dict[str, Any]) -
             )
 
 
-def load_fields(conn, entity_id: str) -> List[Dict[str, Any]]:
+def load_fields(
+    conn,
+    entity_id: str,
+    *,
+    include_stats: bool = True,
+    include_sparse: bool = True,
+) -> List[Dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM atlas_fields WHERE entity_id = ? ORDER BY slug",
         (entity_id,),
     ).fetchall()
-    return [
-        {
+    fields = []
+    for r in rows:
+        occ = r["occurrence_count"] or 0
+        raw_null = r["nullable_ratio"]
+        null_ratio = round(1.0 if raw_null is None else raw_null, 3)
+        if not include_sparse and null_ratio > 0.9 and occ <= 1:
+            continue
+        item: Dict[str, Any] = {
             "slug": r["slug"],
             "inferred_type": r["inferred_type"],
-            "occurrence_count": r["occurrence_count"] or 0,
-            "nullable_ratio": r["nullable_ratio"] or 1.0,
         }
-        for r in rows
-    ]
+        if include_stats:
+            item["occurrence_count"] = occ
+            item["nullable_ratio"] = null_ratio
+        fields.append(item)
+    return fields
 
 
 def get_schema(
@@ -106,8 +119,13 @@ def get_schema(
     entity_name: str,
     table_name: str,
     row_count: int,
+    *,
+    include_stats: bool = False,
+    include_sparse: bool = False,
 ) -> Dict[str, Any]:
-    fields = load_fields(conn, entity_id)
+    fields = load_fields(
+        conn, entity_id, include_stats=include_stats, include_sparse=include_sparse,
+    )
     sample = None
     row = conn.execute(
         f'SELECT _atlas_row_id, _atlas_created_at, _atlas_updated_at, data '

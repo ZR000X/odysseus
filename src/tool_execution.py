@@ -1497,6 +1497,11 @@ _FORMATTER_HANDLED_KEYS = {
     "response", "results", "session_id", "name", "model", "session_name",
     "success", "path", "action", "title", "doc_id", "version", "applied",
     "error", "output",
+    # Atlas manage_atlas — echoed in results/response or redundant for the model
+    "world_id", "world_name", "entity_id", "entity_name", "_used_default_world",
+    "entities", "worlds", "hits", "schema", "count", "document",
+    "inserted_id", "row_id", "inserted_ids", "relationship_id", "stats",
+    "matched_count", "modified_count", "deleted_count", "upserted_id",
 }
 
 

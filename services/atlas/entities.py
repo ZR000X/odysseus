@@ -29,16 +29,31 @@ def _row_to_entity(row, fields: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def list_entities(owner: Optional[str], world_id: str) -> List[Dict[str, Any]]:
+def entity_summary(entity: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": entity["id"],
+        "name": entity["name"],
+        "description": entity.get("description") or "",
+        "row_count": entity.get("row_count") or 0,
+    }
+
+
+def list_entities(
+    owner: Optional[str],
+    world_id: str,
+    *,
+    include_fields: bool = False,
+) -> List[Dict[str, Any]]:
     world = get_world(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
         entities = conn.execute(
             "SELECT * FROM atlas_entities ORDER BY name"
         ).fetchall()
-        return [
-            _row_to_entity(e, load_fields(conn, e["id"]))
-            for e in entities
-        ]
+        result = []
+        for e in entities:
+            fields = load_fields(conn, e["id"]) if include_fields else []
+            result.append(_row_to_entity(e, fields))
+        return result
 
 
 def get_entity(owner: Optional[str], world_id: str, entity_id: str) -> Dict[str, Any]:
@@ -110,6 +125,72 @@ def update_entity(
     from services.atlas.worlds import refresh_world_stats
     refresh_world_stats(owner, world_id)
     return get_entity(owner, world_id, entity_id)
+
+
+def resolve_entity(
+    owner: Optional[str],
+    world_id: str,
+    *,
+    entity_id: Optional[str] = None,
+    entity_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve by full UUID, UUID prefix, or case-insensitive exact name."""
+    eid = (entity_id or "").strip() or None
+    ename = (entity_name or "").strip() or None
+
+    if eid:
+        entities = list_entities(owner, world_id)
+        for e in entities:
+            if e["id"] == eid:
+                return e
+        matches = [e for e in entities if e["id"].startswith(eid)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            names = ", ".join(f'{e["name"]} ({e["id"][:8]})' for e in matches[:5])
+            raise AtlasNotFoundError(
+                f'Ambiguous entity_id prefix "{eid}": {names}. Use full UUID or entity name.'
+            )
+        if not ename:
+            for e in entities:
+                if e["name"].lower() == eid.lower():
+                    return e
+        raise AtlasNotFoundError(
+            f'Entity not found: "{eid}". Try find_entity or list_entities.'
+        )
+
+    if ename:
+        entities = list_entities(owner, world_id)
+        for e in entities:
+            if e["name"].lower() == ename.lower():
+                return e
+        suggestions = find_entities(owner, world_id, ename, limit=3)
+        msg = f'Entity not found: "{ename}". Try find_entity or list_entities.'
+        if suggestions:
+            hints = ", ".join(f'"{s["name"]}" (entity_id: {s["id"][:8]})' for s in suggestions)
+            msg += f" Did you mean: {hints}?"
+        raise AtlasNotFoundError(msg)
+
+    raise AtlasNotFoundError("entity_id or entity_name required")
+
+
+def find_entities(
+    owner: Optional[str],
+    world_id: str,
+    query: str,
+    *,
+    limit: int = 20,
+    include_fields: bool = False,
+) -> List[Dict[str, Any]]:
+    """Case-insensitive substring match on entity name; exact matches ranked first."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    entities = list_entities(owner, world_id, include_fields=include_fields)
+    exact = [e for e in entities if e["name"].lower() == q]
+    partial = [e for e in entities if q in e["name"].lower() and e not in exact]
+    ranked = exact + partial
+    return ranked[: max(1, min(int(limit or 20), 50))]
 
 
 def delete_entity(owner: Optional[str], world_id: str, entity_id: str) -> bool:

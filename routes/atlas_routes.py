@@ -158,10 +158,13 @@ def setup_atlas_routes() -> APIRouter:
             _handle_err(e)
 
     @router.get("/api/atlas/worlds/{world_id}/entities")
-    async def list_entities(request: Request, world_id: str):
+    async def list_entities(request: Request, world_id: str, summary: bool = True):
         owner = _owner(request)
         try:
-            return {"entities": atlas_entities.list_entities(owner, world_id)}
+            entities = atlas_entities.list_entities(owner, world_id, include_fields=not summary)
+            if summary:
+                return {"entities": [atlas_entities.entity_summary(e) for e in entities]}
+            return {"entities": entities}
         except Exception as e:
             _handle_err(e)
 

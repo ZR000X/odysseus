@@ -146,6 +146,75 @@ def resolve_default_world(owner: Optional[str]) -> Dict[str, Any]:
     return create_world(owner, "My World")
 
 
+def _looks_like_uuid(value: str) -> bool:
+    v = (value or "").strip()
+    if len(v) == 36 and v.count("-") == 4:
+        return True
+    return len(v) >= 8 and all(c in "0123456789abcdefABCDEF-" for c in v)
+
+
+def _world_not_found_message(ref: str, owner: Optional[str]) -> str:
+    msg = f'World not found: "{ref}". Try find_world with name="{ref}", or list_worlds.'
+    suggestions = find_worlds(owner, ref, limit=3)
+    if suggestions:
+        hints = ", ".join(f'"{s["name"]}" (world_id: {s["id"][:8]})' for s in suggestions)
+        msg += f" Did you mean: {hints}?"
+    return msg
+
+
+def resolve_world(
+    owner: Optional[str],
+    *,
+    world_id: Optional[str] = None,
+    world_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve by full UUID, UUID prefix, or case-insensitive exact name."""
+    ref_id = (world_id or "").strip() or None
+    ref_name = (world_name or "").strip() or None
+
+    if ref_id:
+        try:
+            return get_world(owner, ref_id)
+        except AtlasNotFoundError:
+            if _looks_like_uuid(ref_id):
+                worlds = list_worlds(owner, archived=False)
+                matches = [w for w in worlds if w["id"].startswith(ref_id)]
+                if len(matches) == 1:
+                    return matches[0]
+                if len(matches) > 1:
+                    names = ", ".join(f'{w["name"]} ({w["id"][:8]})' for w in matches[:5])
+                    raise AtlasNotFoundError(
+                        f'Ambiguous world_id prefix "{ref_id}": {names}. Use full UUID or world name.'
+                    )
+            elif not ref_name:
+                worlds = list_worlds(owner, archived=False)
+                for w in worlds:
+                    if w["name"].lower() == ref_id.lower():
+                        return w
+            raise AtlasNotFoundError(_world_not_found_message(ref_id, owner))
+
+    if ref_name:
+        worlds = list_worlds(owner, archived=False)
+        for w in worlds:
+            if w["name"].lower() == ref_name.lower():
+                return w
+        raise AtlasNotFoundError(_world_not_found_message(ref_name, owner))
+
+    raise AtlasNotFoundError("world_id or world_name required")
+
+
+def find_worlds(owner: Optional[str], query: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+    """Case-insensitive substring match on world name; exact matches ranked first."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    worlds = list_worlds(owner, archived=False)
+    exact = [w for w in worlds if w["name"].lower() == q]
+    partial = [w for w in worlds if q in w["name"].lower() and w not in exact]
+    ranked = exact + partial
+    return ranked[: max(1, min(int(limit or 20), 50))]
+
+
 def refresh_world_stats(owner: Optional[str], world_id: str) -> Dict[str, Any]:
     world = get_world(owner, world_id)
     db_path = world["db_path"]

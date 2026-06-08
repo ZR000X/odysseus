@@ -71,6 +71,7 @@ def atlas_env(tmp_path, monkeypatch):
     csv_mod = _load_atlas_module("csv_io", "csv_io.py")
     canvas_mod = _load_atlas_module("canvas", "canvas.py")
     rels_mod = _load_atlas_module("relationships", "relationships.py")
+    search_mod = _load_atlas_module("search", "search.py")
 
     yield {
         "owner": "testuser",
@@ -83,6 +84,7 @@ def atlas_env(tmp_path, monkeypatch):
         "canvas": canvas_mod,
         "relationships": rels_mod,
         "ddl": ddl,
+        "search": search_mod,
     }
 
 
@@ -345,3 +347,280 @@ def test_legacy_world_db_gets_v2_tables(atlas_env):
             "SELECT value FROM atlas_meta WHERE key='schema_version'"
         ).fetchone()[0]
         assert int(ver) == 2
+
+
+def _tool_env_patch(atlas_env, monkeypatch):
+    wdb = sys.modules["services.atlas.world_db"]
+    monkeypatch.setattr(wdb, "ATLAS_WORLDS_DIR", str(atlas_env["worlds_dir"]))
+    monkeypatch.setattr(
+        wdb, "world_db_path", lambda wid: str(atlas_env["worlds_dir"] / f"{wid}.db")
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_world_by_name(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS")
+    resolved = atlas_env["worlds"].resolve_world(atlas_env["owner"], world_id="CG-BMS")
+    assert resolved["id"] == w["id"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_world_by_prefix(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Prefix World")
+    resolved = atlas_env["worlds"].resolve_world(atlas_env["owner"], world_id=w["id"][:8])
+    assert resolved["id"] == w["id"]
+
+
+@pytest.mark.asyncio
+async def test_find_worlds_substring(atlas_env):
+    atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS")
+    atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS-Dev")
+    matches = atlas_env["worlds"].find_worlds(atlas_env["owner"], "CG-BMS")
+    assert len(matches) == 2
+    assert matches[0]["name"] == "CG-BMS"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_by_name(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    resolved = atlas_env["entities"].resolve_entity(
+        atlas_env["owner"], w["id"], entity_name="customers"
+    )
+    assert resolved["id"] == e["id"]
+
+
+@pytest.mark.asyncio
+async def test_filter_contains_and_in(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "People")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Smith", "state": "NY"}
+    )
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Jones", "state": "CA"}
+    )
+    found = atlas_env["documents"].find(
+        atlas_env["owner"], w["id"], e["id"],
+        filter_obj={"name": {"$contains": "smith"}},
+    )
+    assert found["total"] == 1
+    found2 = atlas_env["documents"].find(
+        atlas_env["owner"], w["id"], e["id"],
+        filter_obj={"state": {"$in": ["NY", "CA"]}},
+    )
+    assert found2["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_search_world(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Notes")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"body": "battery management system"}
+    )
+    hits = atlas_env["search"].search_world(
+        atlas_env["owner"], w["id"], "battery management", limit=5
+    )
+    assert len(hits) == 1
+    assert hits[0]["entity_name"] == "Notes"
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_list_entities_by_world_name(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "list_entities",
+        "world_id": "CG-BMS",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert r["world_name"] == "CG-BMS"
+    assert "Customers" in r["results"]
+    assert "entity_id:" in r["results"]
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_describe_world(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Orders")
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "describe_world",
+        "world_id": "CG-BMS",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert "Orders" in r["results"]
+    assert r["world_id"] == w["id"]
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_find_compact_fields(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"],
+        {"name": "Alice", "email": "a@x.com", "secret": "hidden"},
+    )
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "find",
+        "world_id": w["id"],
+        "entity_name": "Customers",
+        "fields": ["name", "email"],
+        "format": "compact",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert "name=Alice" in r["results"]
+    assert "secret" not in r["results"]
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_create_relationship_by_name(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Orders")
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "create_relationship",
+        "world_id": w["id"],
+        "from_entity_name": "Customers",
+        "to_entity_name": "Orders",
+        "from_field": "id",
+        "to_field": "customer_id",
+        "rel_type": "one_to_many",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert "Customers.id" in r["response"]
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_default_world_flag(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Only World")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "countDocuments",
+        "entity_name": "Items",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert r.get("_used_default_world") is True
+    assert r["world_name"] == "Only World"
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_find_world(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+
+    atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS")
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "find_world",
+        "name": "CG-BMS",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert "world_id:" in r["results"]
+    assert "CG-BMS" in r["results"]
+
+
+@pytest.mark.asyncio
+async def test_list_entities_summary_default_no_fields(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alice", "qty": 5},
+    )
+    entities = atlas_env["entities"].list_entities(atlas_env["owner"], w["id"])
+    assert entities[0]["fields"] == []
+    summary = atlas_env["entities"].entity_summary(entities[0])
+    assert set(summary.keys()) == {"id", "name", "description", "row_count"}
+
+
+@pytest.mark.asyncio
+async def test_list_entities_include_fields(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alice"},
+    )
+    entities = atlas_env["entities"].list_entities(
+        atlas_env["owner"], w["id"], include_fields=True,
+    )
+    slugs = {f["slug"] for f in entities[0]["fields"]}
+    assert "name" in slugs
+
+
+@pytest.mark.asyncio
+async def test_do_manage_atlas_list_entities_summary_output(atlas_env, monkeypatch):
+    _tool_env_patch(atlas_env, monkeypatch)
+    from src.tool_implementations import do_manage_atlas
+    from src.tool_execution import format_tool_result
+
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "CG-BMS")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alice", "email": "a@x.com"},
+    )
+
+    r = await do_manage_atlas(json.dumps({
+        "action": "list_entities",
+        "world_id": "CG-BMS",
+    }), owner=atlas_env["owner"])
+    assert r["exit_code"] == 0
+    assert r["entities"] == [{
+        "id": e["id"],
+        "name": "Customers",
+        "description": "",
+        "row_count": 1,
+    }]
+    assert "nullable_ratio" not in r["results"]
+    formatted = format_tool_result("manage_atlas", r)
+    assert "**data:**" not in formatted
+    assert len(formatted) < 500
+
+
+@pytest.mark.asyncio
+async def test_app_api_blocks_atlas(monkeypatch):
+    from src.tool_implementations import do_app_api
+
+    r = await do_app_api(json.dumps({
+        "action": "call",
+        "method": "GET",
+        "path": "/api/atlas/worlds/abc/entities",
+    }), owner="testuser")
+    assert r["exit_code"] == 1
+    assert "manage_atlas" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_schema_sparse_filter(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Products")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"sku": "A1", "noise": None},
+    )
+    schema = atlas_env["documents"].get_entity_schema(
+        atlas_env["owner"], w["id"], e["id"], include_sparse=False, include_stats=True,
+    )
+    slugs = {f["slug"] for f in schema["fields"]}
+    assert "sku" in slugs
+    assert "noise" not in slugs
+    sku_field = next(f for f in schema["fields"] if f["slug"] == "sku")
+    assert sku_field["nullable_ratio"] == 0.0

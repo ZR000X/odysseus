@@ -25,23 +25,29 @@ Deep link: `/atlas`
 ## Agent workflow
 
 ```
-get_schema → find → updateOne / insertOne
+describe_world / find_world  →  find / countDocuments  →  updateOne / insertOne
 ```
 
-Each document has an auto `_id`. Call `get_schema` before writing unfamiliar collections.
+**world_id** accepts a full UUID, 8-character prefix, or exact world name (case-insensitive). **entity_name** resolves collections the same way. Omit `world_id` only when the user has one world or means the default (most recently updated).
+
+Call `get_schema` only when field names are unknown. Use `format=compact` or `fields=[...]` on `find` to save tokens.
 
 ### manage_atlas actions
 
 | Action | Description |
 |--------|-------------|
-| `list_worlds` | List worlds |
+| `list_worlds` | List all worlds |
+| `find_world` | Find worlds by name substring |
 | `create_world` | Create world (`name`) |
+| `describe_world` | World snapshot + collections |
 | `list_entities` | List collections in a world |
+| `find_entity` | Find collections by name substring |
 | `create_entity` | Create collection (`name` only — no columns required) |
 | `get_schema` | Inferred fields + sample document |
-| `find` | Query with `filter` object, `limit`, `offset` |
+| `find` | Query with `filter`, `limit`, `offset`, `format`, `fields` |
 | `findOne` | First matching document |
 | `countDocuments` | Count matches |
+| `search` | Cross-collection text search within a world |
 | `insertOne` | Insert document (`document` object) |
 | `insertMany` | Batch insert (`documents` array) |
 | `updateOne` | `filter` + `update` (plain merge or `$set`/`$unset`/`$inc`) |
@@ -53,14 +59,51 @@ Each document has an auto `_id`. Call `get_schema` before writing unfamiliar col
 
 Legacy aliases: `list_rows`→`find`, `add_row`→`insertOne`, `update_row`→`updateOne`, `delete_row`→`deleteOne`.
 
-### Examples
+### Filter operators
 
+| Operator | Example |
+|----------|---------|
+| Equality | `{"status": "active"}` |
+| `$in` | `{"state": {"$in": ["NY", "CA"]}}` |
+| `$contains` | `{"name": {"$contains": "smith"}}` |
+| `$ne` | `{"status": {"$ne": "archived"}}` |
+| `$gt` / `$gte` / `$lt` / `$lte` | `{"qty": {"$gt": 10}}` |
+
+### Agent cookbook
+
+**Orient — what's in a world?**
 ```json
-{"action": "get_schema", "entity_name": "Customers"}
-{"action": "find", "entity_name": "Customers", "filter": {"status": "active"}, "limit": 10}
-{"action": "insertOne", "entity_name": "Customers", "document": {"name": "Alice", "email": "a@example.com"}}
-{"action": "updateOne", "filter": {"_id": 3}, "update": {"$set": {"status": "archived"}}}
-{"action": "updateMany", "filter": {"region": "EU"}, "update": {"$set": {"currency": "EUR"}}}
+{"action": "describe_world", "world_id": "CG-BMS"}
+```
+
+**Read — active customers (compact, projected fields)**
+```json
+{"action": "find", "world_id": "CG-BMS", "entity_name": "Customers", "filter": {"status": "active"}, "fields": ["name", "email"], "format": "compact", "limit": 10}
+```
+
+**Read — count documents**
+```json
+{"action": "countDocuments", "world_id": "CG-BMS", "entity_name": "Orders"}
+```
+
+**Read — cross-collection search**
+```json
+{"action": "search", "world_id": "CG-BMS", "query": "battery management", "limit": 10}
+```
+
+**Write — insert a row**
+```json
+{"action": "insertOne", "world_id": "CG-BMS", "entity_name": "Customers", "document": {"name": "Alice", "email": "a@example.com"}}
+```
+
+**Write — update by _id**
+```json
+{"action": "updateOne", "entity_name": "Customers", "filter": {"_id": 3}, "update": {"$set": {"status": "archived"}}}
+```
+
+**Write — link collections**
+```json
+{"action": "create_relationship", "world_id": "CG-BMS", "from_entity_name": "Customers", "to_entity_name": "Orders", "from_field": "id", "to_field": "customer_id", "rel_type": "one_to_many"}
 ```
 
 ## HTTP API

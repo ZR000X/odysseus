@@ -14,10 +14,68 @@ def _json_path(field: str) -> str:
     return path
 
 
+def _compile_field_operator(path: str, op: str, op_val: Any) -> Tuple[str, List[Any]]:
+    if op == "$in":
+        if not isinstance(op_val, list) or not op_val:
+            raise ValueError("$in requires a non-empty array")
+        placeholders = ", ".join("?" for _ in op_val)
+        clause = f"json_extract(data, ?) IN ({placeholders})"
+        params: List[Any] = [path]
+        for item in op_val:
+            params.append(json.dumps(item) if isinstance(item, (dict, list)) else item)
+        return clause, params
+    if op == "$contains":
+        needle = str(op_val).lower()
+        return "LOWER(json_extract(data, ?)) LIKE ?", [path, f"%{needle}%"]
+    if op == "$ne":
+        if op_val is None:
+            return "json_extract(data, ?) IS NOT NULL", [path]
+        return "json_extract(data, ?) != ?", [path, json.dumps(op_val) if isinstance(op_val, (dict, list)) else op_val]
+    if op in ("$gt", "$gte", "$lt", "$lte"):
+        sql_op = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}[op]
+        return f"json_extract(data, ?) {sql_op} ?", [path, op_val]
+    raise ValueError(f"Unsupported filter operator: {op}")
+
+
+def _compile_field_clause(key: str, val: Any) -> Tuple[str, List[Any]]:
+    if key in ("_id", "_atlas_row_id"):
+        if isinstance(val, dict):
+            raise ValueError("_id does not support operator filters")
+        if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
+            n = int(val)
+            return (
+                "(_atlas_row_id = ? OR json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ?)",
+                [n, n, val],
+            )
+        return (
+            "(json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ?)",
+            [val, json.dumps(val)],
+        )
+
+    path = _json_path(key)
+    if isinstance(val, dict) and val and all(str(k).startswith("$") for k in val):
+        sub_clauses: List[str] = []
+        sub_params: List[Any] = []
+        for op, op_val in val.items():
+            c, p = _compile_field_operator(path, op, op_val)
+            sub_clauses.append(c)
+            sub_params.extend(p)
+        return " AND ".join(f"({c})" for c in sub_clauses), sub_params
+
+    if isinstance(val, bool):
+        return (
+            f"(json_extract(data, ?) = ? OR json_extract(data, ?) = ?)",
+            [path, 1 if val else 0, path, val],
+        )
+    if val is None:
+        return "json_extract(data, ?) IS NULL", [path]
+    return "json_extract(data, ?) = ?", [path, json.dumps(val) if isinstance(val, (dict, list)) else val]
+
+
 def compile_filter(filter_obj: Optional[Dict[str, Any]] = None) -> Tuple[str, List[Any]]:
     """
-    Compile MongoDB-style equality filter to SQL WHERE clause.
-    Supports _id / _atlas_row_id and dotted json paths.
+    Compile MongoDB-style filter to SQL WHERE clause.
+    Supports _id / _atlas_row_id, dotted json paths, and $in/$contains/$ne/$gt/$gte/$lt/$lte.
     Returns (where_sql, params) — empty where if no filter.
     """
     if not filter_obj:
@@ -27,33 +85,11 @@ def compile_filter(filter_obj: Optional[Dict[str, Any]] = None) -> Tuple[str, Li
     params: List[Any] = []
 
     for key, val in filter_obj.items():
-        if key in ("_id", "_atlas_row_id"):
-            if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
-                n = int(val)
-                clauses.append(
-                    "(_atlas_row_id = ? OR json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ?)"
-                )
-                params.extend([n, n, val])
-            else:
-                clauses.append(
-                    "(json_extract(data, '$._id') = ? OR json_extract(data, '$._id') = ?)"
-                )
-                params.extend([val, json.dumps(val)])
-        elif key.startswith("$"):
+        if key.startswith("$"):
             raise ValueError(f"Unsupported filter operator at top level: {key}")
-        else:
-            path = _json_path(key)
-            if isinstance(val, bool):
-                clauses.append(
-                    f"(json_extract(data, ?) = ? OR json_extract(data, ?) = ?)"
-                )
-                params.extend([path, 1 if val else 0, path, val])
-            elif val is None:
-                clauses.append(f"json_extract(data, ?) IS NULL")
-                params.append(path)
-            else:
-                clauses.append(f"json_extract(data, ?) = ?")
-                params.extend([path, json.dumps(val) if isinstance(val, (dict, list)) else val])
+        clause, clause_params = _compile_field_clause(key, val)
+        clauses.append(clause)
+        params.extend(clause_params)
 
     if not clauses:
         return "", []

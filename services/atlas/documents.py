@@ -382,12 +382,21 @@ def _delete_by_id(owner: Optional[str], world_id: str, entity_id: str, row_id: i
     refresh_world_stats(owner, world_id)
 
 
-def get_entity_schema(owner: Optional[str], world_id: str, entity_id: str) -> Dict[str, Any]:
+def get_entity_schema(
+    owner: Optional[str],
+    world_id: str,
+    entity_id: str,
+    *,
+    include_stats: bool = False,
+    include_sparse: bool = False,
+) -> Dict[str, Any]:
     entity = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
         return get_schema(
-            conn, entity_id, entity["name"], entity["table_name"], entity["row_count"]
+            conn, entity_id, entity["name"], entity["table_name"], entity["row_count"],
+            include_stats=include_stats,
+            include_sparse=include_sparse,
         )
 
 
