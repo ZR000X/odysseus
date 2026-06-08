@@ -3025,7 +3025,7 @@ async function _cmdTourTheme(args, ctx) {
       before: () => _clickTab('theme-tab-customize'),
       interactive: true },
     { sel: '#theme-bg-pattern-select',
-      text: 'Add a <b>background animation</b> — rain, petals, constellations, sparkles, embers…',
+      text: 'Add a <b>background animation</b> — rain, petals, bubbles, constellations, sparkles, embers…',
       before: () => _clickTab('theme-tab-customize'),
       interactive: true },
     { sel: '#theme-opacity-wrap',
