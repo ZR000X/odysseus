@@ -2136,6 +2136,8 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
     from services.atlas import relationships as atlas_relationships
     from services.atlas import search as atlas_search
     from services.atlas import clusters as atlas_clusters
+    from services.atlas import keys as atlas_keys
+    from services.atlas import queries as atlas_queries
     from services.atlas.worlds import AtlasNotFoundError, AtlasAccessError
 
     try:
@@ -2181,6 +2183,9 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
         "assign_entity_to_cluster": "assign_entity_to_cluster",
         "find_world": "find_world", "find_entity": "find_entity",
         "describe_world": "describe_world", "search": "search",
+        "list_keys": "list_keys", "create_key": "create_key",
+        "list_queries": "list_queries", "create_query": "create_query",
+        "update_query": "update_query", "execute_query": "execute_query",
     }
     action = _CAMEL.get(action, action)
 
@@ -2366,22 +2371,96 @@ async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
                 entity_id=args.get("to_entity_id"),
                 entity_name=args.get("to_entity_name"),
             )
-            if not (args.get("from_field") is not None and args.get("to_field") is not None):
-                return {"error": "from_field and to_field are required", "exit_code": 1}
-            r = atlas_relationships.create_relationship(
-                owner, world["id"],
-                from_e["id"], to_e["id"],
-                args.get("rel_type") or "one_to_many",
-                args["from_field"], args["to_field"],
-                label=args.get("label") or "",
-                from_cardinality=args.get("from_cardinality"),
-                to_cardinality=args.get("to_cardinality"),
+            from_key_id = args.get("from_key_id")
+            to_key_id = args.get("to_key_id")
+            if from_key_id and to_key_id:
+                r = atlas_relationships.create_relationship(
+                    owner, world["id"],
+                    from_e["id"], to_e["id"],
+                    args.get("rel_type") or "one_to_many",
+                    from_key_id=from_key_id, to_key_id=to_key_id,
+                    label=args.get("label") or "",
+                    from_cardinality=args.get("from_cardinality"),
+                    to_cardinality=args.get("to_cardinality"),
+                )
+                fk = r.get("from_key", {}).get("name", "")
+                tk = r.get("to_key", {}).get("name", "")
+                msg = f"Created relationship {from_e['name']}.{fk} → {to_e['name']}.{tk}"
+            else:
+                if not (args.get("from_field") is not None and args.get("to_field") is not None):
+                    return {"error": "from_key_id/to_key_id or from_field/to_field required", "exit_code": 1}
+                r = atlas_relationships.create_relationship(
+                    owner, world["id"],
+                    from_e["id"], to_e["id"],
+                    args.get("rel_type") or "one_to_many",
+                    args["from_field"], args["to_field"],
+                    label=args.get("label") or "",
+                    from_cardinality=args.get("from_cardinality"),
+                    to_cardinality=args.get("to_cardinality"),
+                )
+                msg = f"Created relationship {from_e['name']}.{args['from_field']} → {to_e['name']}.{args['to_field']}"
+            return _ctx_world(world, used_default, response=msg, relationship_id=r["id"])
+
+        if action == "list_keys":
+            entity = _resolve_entity(world["id"])
+            keys = atlas_keys.list_keys(owner, world["id"], entity["id"])
+            return _ctx_entity(world, entity, used_default, keys=keys)
+
+        if action == "create_key":
+            entity = _resolve_entity(world["id"])
+            slugs = args.get("field_slugs") or args.get("fields") or []
+            if not args.get("name") or not slugs:
+                return {"error": "name and field_slugs are required", "exit_code": 1}
+            key = atlas_keys.create_key(owner, world["id"], entity["id"], args["name"], slugs)
+            return _ctx_entity(world, entity, used_default, response=f"Created key {key['name']}", key=key)
+
+        if action == "list_queries":
+            queries = atlas_queries.list_queries(owner, world["id"])
+            return _ctx_world(world, used_default, queries=queries)
+
+        if action == "create_query":
+            if not args.get("name") or not args.get("sql_text"):
+                return {"error": "name and sql_text are required", "exit_code": 1}
+            q = atlas_queries.create_query(
+                owner, world["id"], args["name"], args["sql_text"],
+                description=args.get("description") or "",
             )
-            return _ctx_world(
-                world, used_default,
-                response=f"Created relationship {from_e['name']}.{args['from_field']} → {to_e['name']}.{args['to_field']}",
-                relationship_id=r["id"],
+            return _ctx_world(world, used_default, response=f"Created query {q['name']}", query=q)
+
+        if action == "update_query":
+            qid = args.get("query_id")
+            qname = args.get("query_name")
+            if not qid and qname:
+                for q in atlas_queries.list_queries(owner, world["id"]):
+                    if q["name"].lower() == qname.lower():
+                        qid = q["id"]
+                        break
+            if not qid:
+                return {"error": "query_id or query_name required", "exit_code": 1}
+            q = atlas_queries.update_query(
+                owner, world["id"], qid,
+                name=args.get("rename"),
+                sql_text=args.get("sql_text"),
+                description=args.get("description"),
             )
+            return _ctx_world(world, used_default, response=f"Updated query {q['name']}", query=q)
+
+        if action == "execute_query":
+            qid = args.get("query_id")
+            qname = args.get("query_name") or args.get("name")
+            if not qid and qname:
+                for q in atlas_queries.list_queries(owner, world["id"]):
+                    if q["name"].lower() == qname.lower():
+                        qid = q["id"]
+                        break
+            if not qid:
+                return {"error": "query_id or query_name required", "exit_code": 1}
+            result = atlas_queries.execute_query(
+                owner, world["id"], qid,
+                limit=int(args.get("limit") or 20),
+                offset=int(args.get("offset") or 0),
+            )
+            return _ctx_world(world, used_default, documents=result["documents"], total=result["total"])
 
         if action == "list_clusters":
             clusters = atlas_clusters.list_clusters(owner, world["id"])
@@ -3429,9 +3508,12 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
     if "/api/atlas/" in path:
         return {
             "error": (
-                "Don't hit /api/atlas/* via app_api — use manage_atlas. "
-                "For entity lists use describe_world or list_entities (summary). "
-                "For field details use get_schema."
+                "Don't hit /api/atlas/* via app_api — use the manage_atlas tool. "
+                "describe_world, list_entities, get_schema, find, list_queries, "
+                "create_query, and update_query are actions inside manage_atlas "
+                "(not separate tools). Example: "
+                '{"action":"get_schema","world_id":"CG-BMS","entity_name":"Customers"} '
+                'or {"action":"list_queries","world_id":"CG-BMS"}.'
             ),
             "exit_code": 1,
         }

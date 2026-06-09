@@ -3,7 +3,7 @@
  */
 import { renderCompassDocument, highlightJson } from './atlas-json-tree.js';
 import { toastCopied } from './atlas-toast.js';
-import { buildDocKeyIndex, docGetField } from './atlas-field-resolve.js';
+import { buildDocKeyIndex, docGetField, fieldDisplayName } from './atlas-field-resolve.js';
 
 function _esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -89,7 +89,7 @@ export function renderTableView(docs, fields) {
     </th>
     ${fieldCols.map(f => `
       <th>
-        <div class="atlas-table-col-name">${_esc(f.slug)}</div>
+        <div class="atlas-table-col-name">${_esc(fieldDisplayName(f))}</div>
         <div class="atlas-table-col-type">${_esc(f.inferred_type || 'Mixed')}</div>
       </th>`).join('')}
     <th class="atlas-table-col-actions"></th>`;

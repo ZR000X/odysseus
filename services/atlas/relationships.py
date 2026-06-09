@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.atlas.keys import get_key_by_id
 from services.atlas.world_db import open_world_db
 from services.atlas.worlds import AtlasNotFoundError, get_world
 
@@ -76,8 +77,30 @@ def normalize_rel_type(
     )
 
 
-def _row_to_rel(row) -> Dict[str, Any]:
+def _slugs_display(slugs: List[str]) -> str:
+    return " + ".join(slugs) if slugs else ""
+
+
+def _enrich_key(conn, key_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not key_id:
+        return None
+    key = get_key_by_id(conn, key_id)
+    if not key:
+        return None
+    return {
+        "id": key["id"],
+        "name": key["name"],
+        "field_slugs": key["field_slugs"],
+        "display": _slugs_display(key["field_slugs"]),
+    }
+
+
+def _row_to_rel(row, conn=None) -> Dict[str, Any]:
     from_c, to_c = parse_cardinalities(row["rel_type"])
+    from_key_id = row["from_key_id"] if "from_key_id" in row.keys() else None
+    to_key_id = row["to_key_id"] if "to_key_id" in row.keys() else None
+    from_key = _enrich_key(conn, from_key_id) if conn else None
+    to_key = _enrich_key(conn, to_key_id) if conn else None
     return {
         "id": row["id"],
         "from_entity_id": row["from_entity_id"],
@@ -87,6 +110,10 @@ def _row_to_rel(row) -> Dict[str, Any]:
         "to_cardinality": to_c,
         "from_field": row["from_field"],
         "to_field": row["to_field"],
+        "from_key_id": from_key_id,
+        "to_key_id": to_key_id,
+        "from_key": from_key,
+        "to_key": to_key,
         "label": row["label"] or "",
         "from_anchor": row["from_anchor"] or "right",
         "to_anchor": row["to_anchor"] or "left",
@@ -95,13 +122,37 @@ def _row_to_rel(row) -> Dict[str, Any]:
     }
 
 
+def _validate_keys(
+    conn,
+    from_entity_id: str,
+    to_entity_id: str,
+    from_key_id: str,
+    to_key_id: str,
+) -> Tuple[str, str]:
+    from_key = get_key_by_id(conn, from_key_id)
+    to_key = get_key_by_id(conn, to_key_id)
+    if not from_key:
+        raise ValueError(f"from_key_id not found: {from_key_id}")
+    if not to_key:
+        raise ValueError(f"to_key_id not found: {to_key_id}")
+    if from_key["entity_id"] != from_entity_id:
+        raise ValueError("from_key_id does not belong to from_entity")
+    if to_key["entity_id"] != to_entity_id:
+        raise ValueError("to_key_id does not belong to to_entity")
+    if len(from_key["field_slugs"]) != len(to_key["field_slugs"]):
+        raise ValueError(
+            "Composite keys must have the same number of columns on both sides"
+        )
+    return _slugs_display(from_key["field_slugs"]), _slugs_display(to_key["field_slugs"])
+
+
 def list_relationships(owner: Optional[str], world_id: str) -> List[Dict[str, Any]]:
     world = get_world(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
         rows = conn.execute(
             "SELECT * FROM atlas_relationships ORDER BY created_at"
         ).fetchall()
-        return [_row_to_rel(r) for r in rows]
+        return [_row_to_rel(r, conn) for r in rows]
 
 
 def get_relationship(owner: Optional[str], world_id: str, rel_id: str) -> Dict[str, Any]:
@@ -112,7 +163,7 @@ def get_relationship(owner: Optional[str], world_id: str, rel_id: str) -> Dict[s
         ).fetchone()
         if not row:
             raise AtlasNotFoundError(f"Relationship not found: {rel_id}")
-        return _row_to_rel(row)
+        return _row_to_rel(row, conn)
 
 
 def create_relationship(
@@ -121,29 +172,38 @@ def create_relationship(
     from_entity_id: str,
     to_entity_id: str,
     rel_type: str,
-    from_field: str,
-    to_field: str,
+    from_field: str = "",
+    to_field: str = "",
     label: str = "",
     from_anchor: str = "right",
     to_anchor: str = "left",
     from_cardinality: Optional[str] = None,
     to_cardinality: Optional[str] = None,
+    from_key_id: Optional[str] = None,
+    to_key_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     rel_type = normalize_rel_type(rel_type, from_cardinality, to_cardinality)
-    from_field = from_field or ""
-    to_field = to_field or ""
     rel_id = str(uuid.uuid4())
     now = _utcnow_iso()
     world = get_world(owner, world_id)
     with open_world_db(world["db_path"]) as conn:
+        if from_key_id and to_key_id:
+            from_field, to_field = _validate_keys(
+                conn, from_entity_id, to_entity_id, from_key_id, to_key_id,
+            )
+        else:
+            from_field = from_field or ""
+            to_field = to_field or ""
         conn.execute(
             """INSERT INTO atlas_relationships
                (id, from_entity_id, to_entity_id, rel_type, from_field, to_field,
-                label, from_anchor, to_anchor, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                from_key_id, to_key_id, label, from_anchor, to_anchor,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rel_id, from_entity_id, to_entity_id, rel_type,
-                from_field, to_field, label, from_anchor, to_anchor, now, now,
+                from_field, to_field, from_key_id, to_key_id,
+                label, from_anchor, to_anchor, now, now,
             ),
         )
     return get_relationship(owner, world_id, rel_id)
@@ -169,6 +229,7 @@ def update_relationship(
         "from_anchor", "to_anchor",
         "from_entity_id", "to_entity_id",
         "from_cardinality", "to_cardinality",
+        "from_key_id", "to_key_id",
     }
     sets = []
     vals = []
@@ -211,6 +272,17 @@ def update_relationship(
         for eid in (new_from, new_to):
             if not _entity_exists(conn, eid):
                 raise ValueError(f"Entity not found: {eid}")
+
+        from_key_id = kwargs.get("from_key_id", current["from_key_id"] if "from_key_id" in current.keys() else None)
+        to_key_id = kwargs.get("to_key_id", current["to_key_id"] if "to_key_id" in current.keys() else None)
+        if from_key_id and to_key_id:
+            from_field, to_field = _validate_keys(conn, new_from, new_to, from_key_id, to_key_id)
+            if "from_field" not in kwargs:
+                sets.append("from_field = ?")
+                vals.append(from_field)
+            if "to_field" not in kwargs:
+                sets.append("to_field = ?")
+                vals.append(to_field)
 
         sets.append("updated_at = ?")
         vals.append(now)

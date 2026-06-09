@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import json
-import uuid
 from typing import Any, Dict, List, Optional
 
-from services.atlas.entities import get_entity
-from services.atlas.fields import get_schema, infer_fields_from_document, load_fields
+from services.atlas.entities import get_entity, get_entity_table
+from services.atlas.fields import get_schema, infer_fields_from_document, infer_fields_from_documents, load_fields
 from services.atlas.query import compile_filter, compile_sort
 from services.atlas.world_db import open_world_db
 from services.atlas.worlds import AtlasNotFoundError, get_world, refresh_world_stats
@@ -72,6 +71,199 @@ def _id_exists_in_table(conn, table: str, external_id: Any) -> bool:
     return row is not None
 
 
+def _load_id_to_row_map(conn, table: str) -> Dict[Any, int]:
+    """Map document _id / _atlas_row_id values to internal row ids."""
+    id_map: Dict[Any, int] = {}
+    rows = conn.execute(
+        f"SELECT _atlas_row_id, json_extract(data, '$._id') AS ext_id "
+        f"FROM {_quote_ident(table)}"
+    ).fetchall()
+    for row in rows:
+        rid = row["_atlas_row_id"]
+        for key in (rid, str(rid)):
+            id_map[key] = rid
+        ext = row["ext_id"]
+        if ext is None:
+            continue
+        norm = _normalize_mongo_id(ext)
+        for key in (norm, str(norm), json.dumps(norm)):
+            id_map[key] = rid
+    return id_map
+
+
+def _resolve_merge_row_id(id_map: Dict[Any, int], merge_id: Any) -> Optional[int]:
+    if merge_id is None or merge_id == "":
+        return None
+    norm = int(merge_id) if isinstance(merge_id, str) and merge_id.isdigit() else merge_id
+    for key in (norm, str(norm), json.dumps(norm)):
+        if key in id_map:
+            return id_map[key]
+    return None
+
+
+def _strip_import_meta(document: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in document.items() if k != "_import_merge_id"}
+
+
+def import_documents_bulk(
+    owner: Optional[str],
+    world_id: str,
+    entity_id: str,
+    documents: List[Dict[str, Any]],
+    *,
+    mode: str = "append",
+) -> Dict[str, Any]:
+    """Bulk import documents in a single transaction with deferred metadata updates."""
+    mode = (mode or "append").lower()
+    if mode not in ("append", "merge", "replace"):
+        raise ValueError("mode must be append, merge, or replace")
+
+    entity = get_entity_table(owner, world_id, entity_id)
+    table = entity["table_name"]
+    stats: Dict[str, Any] = {
+        "rows_total": len(documents),
+        "rows_inserted": 0,
+        "rows_updated": 0,
+        "rows_skipped": 0,
+        "rows_failed": 0,
+        "errors": [],
+        "inserted_ids": [],
+    }
+    if not documents:
+        return stats
+
+    to_insert: List[tuple[int, Dict[str, Any]]] = []
+    to_update: List[tuple[int, int, Dict[str, Any]]] = []
+    infer_docs: List[Dict[str, Any]] = []
+    has_explicit_ids = any(
+        "_id" in _prepare_insert_data(_strip_import_meta(doc))
+        or doc.get("_import_merge_id") not in (None, "")
+        for doc in documents
+    )
+
+    with open_world_db(entity["db_path"]) as conn:
+        if mode == "replace":
+            conn.execute(f"DELETE FROM {_quote_ident(table)}")
+            conn.execute(
+                "UPDATE atlas_entities SET row_count = 0, updated_at = datetime('now') WHERE id = ?",
+                (entity_id,),
+            )
+
+        existing_ids: set = set()
+        id_map: Dict[Any, int] = {}
+        if mode in ("append", "merge") and has_explicit_ids:
+            id_map = _load_id_to_row_map(conn, table)
+            existing_ids = set(id_map.keys())
+        elif mode == "merge":
+            id_map = _load_id_to_row_map(conn, table)
+
+        for i, raw in enumerate(documents):
+            merge_id = raw.get("_import_merge_id")
+            doc = _strip_import_meta(raw)
+            try:
+                data = _prepare_insert_data(doc)
+            except Exception as e:
+                stats["rows_failed"] += 1
+                stats["errors"].append({"index": i, "message": str(e)})
+                continue
+
+            if mode == "merge" and merge_id not in (None, ""):
+                row_id = _resolve_merge_row_id(id_map, merge_id)
+                if row_id is not None:
+                    to_update.append((i, row_id, data))
+                    continue
+                if "_id" in data:
+                    dup_key = data["_id"]
+                    for key in (dup_key, str(dup_key), json.dumps(dup_key)):
+                        if key in existing_ids:
+                            stats["rows_failed"] += 1
+                            stats["errors"].append({"index": i, "message": f"Duplicate _id: {dup_key}"})
+                            break
+                    else:
+                        to_insert.append((i, data))
+                    continue
+                to_insert.append((i, data))
+                continue
+
+            if not data and mode != "append":
+                stats["rows_skipped"] += 1
+                continue
+
+            if "_id" in data:
+                dup_key = data["_id"]
+                is_dup = False
+                for key in (dup_key, str(dup_key), json.dumps(dup_key)):
+                    if key in existing_ids:
+                        stats["rows_failed"] += 1
+                        stats["errors"].append({"index": i, "message": f"Duplicate _id: {dup_key}"})
+                        is_dup = True
+                        break
+                if is_dup:
+                    continue
+
+            to_insert.append((i, data))
+
+        update_ts = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        for i, row_id, data in to_update:
+            try:
+                row = conn.execute(
+                    f"SELECT data FROM {_quote_ident(table)} WHERE _atlas_row_id = ?",
+                    (row_id,),
+                ).fetchone()
+                if not row:
+                    to_insert.append((i, data))
+                    continue
+                existing = json.loads(row["data"] or "{}")
+                new_data = _apply_update(existing, data)
+                conn.execute(
+                    f"UPDATE {_quote_ident(table)} SET data = ?, _atlas_updated_at = {update_ts} "
+                    f"WHERE _atlas_row_id = ?",
+                    (json.dumps(new_data), row_id),
+                )
+                infer_docs.append(new_data)
+                stats["rows_updated"] += 1
+            except Exception as e:
+                stats["rows_failed"] += 1
+                stats["errors"].append({"index": i, "message": str(e)})
+
+        insert_sql = f"INSERT INTO {_quote_ident(table)} (data) VALUES (?)"
+        insert_params: List[tuple[str]] = []
+        for i, data in to_insert:
+            insert_params.append((json.dumps(data),))
+            key = data.get("_id")
+            if key is not None:
+                for k in (key, str(key), json.dumps(key)):
+                    existing_ids.add(k)
+
+        if insert_params:
+            conn.executemany(insert_sql, insert_params)
+            first_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            count = len(insert_params)
+            first_id = first_id - count + 1
+            stats["inserted_ids"] = list(range(first_id, first_id + count))
+            stats["rows_inserted"] = count
+            infer_docs.extend(data for _, data in to_insert)
+
+        if mode == "replace":
+            conn.execute(
+                "UPDATE atlas_entities SET row_count = ?, updated_at = datetime('now') WHERE id = ?",
+                (stats["rows_inserted"], entity_id),
+            )
+        elif stats["rows_inserted"]:
+            conn.execute(
+                "UPDATE atlas_entities SET row_count = row_count + ?, updated_at = datetime('now') WHERE id = ?",
+                (stats["rows_inserted"], entity_id),
+            )
+
+        if infer_docs:
+            infer_fields_from_documents(conn, entity_id, infer_docs)
+
+    if stats["rows_inserted"] or stats["rows_updated"] or mode == "replace":
+        refresh_world_stats(owner, world_id)
+
+    return stats
+
+
 def _apply_update(existing: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(existing)
     has_operator = any(k.startswith("$") for k in update)
@@ -104,6 +296,33 @@ def _apply_update(existing: Dict[str, Any], update: Dict[str, Any]) -> Dict[str,
     return result
 
 
+def _compile_entity_filter(
+    owner: Optional[str],
+    world_id: str,
+    entity_id: str,
+    table: str,
+    filter_obj: Optional[Dict[str, Any]],
+) -> tuple:
+    extra_where = ""
+    extra_params: List[Any] = []
+    filt = dict(filter_obj) if filter_obj else {}
+    key_violation = filt.pop("$keyViolation", None)
+    if key_violation:
+        from services.atlas.key_violations import compile_key_violation_filter, load_slug_to_key
+        from services.atlas.keys import get_key
+        from services.atlas.world_db import open_world_db
+        from services.atlas.worlds import get_world
+        key = get_key(owner, world_id, entity_id, str(key_violation))
+        world = get_world(owner, world_id)
+        with open_world_db(world["db_path"]) as conn:
+            slug_to_key = load_slug_to_key(conn, table)
+        extra_where, extra_params = compile_key_violation_filter(
+            table, key["field_slugs"], slug_to_key=slug_to_key
+        )
+        extra_where = extra_where.replace(" WHERE ", "", 1) if extra_where.startswith(" WHERE ") else extra_where
+    return compile_filter(filt or None, extra_where=extra_where, extra_params=extra_params)
+
+
 def find(
     owner: Optional[str],
     world_id: str,
@@ -118,7 +337,7 @@ def find(
     entity = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)
     table = entity["table_name"]
-    where, params = compile_filter(filter_obj)
+    where, params = _compile_entity_filter(owner, world_id, entity_id, table, filter_obj)
     order = compile_sort(sort)
     sql = f"SELECT _atlas_row_id, _atlas_created_at, _atlas_updated_at, data FROM {_quote_ident(table)}{where}{order} LIMIT ? OFFSET ?"
     count_sql = f"SELECT COUNT(*) FROM {_quote_ident(table)}{where}"
@@ -149,7 +368,7 @@ def count_documents(
     entity = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)
     table = entity["table_name"]
-    where, params = compile_filter(filter_obj)
+    where, params = _compile_entity_filter(owner, world_id, entity_id, table, filter_obj)
     with open_world_db(world["db_path"]) as conn:
         return conn.execute(
             f"SELECT COUNT(*) FROM {_quote_ident(table)}{where}", params
@@ -194,44 +413,14 @@ def insert_many(
     entity_id: str,
     documents: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    entity = get_entity(owner, world_id, entity_id)
-    world = get_world(owner, world_id)
-    table = entity["table_name"]
-    ids: List[int] = []
-    errors: List[Dict[str, Any]] = []
-    inserted_count = 0
-
-    with open_world_db(world["db_path"]) as conn:
-        for i, document in enumerate(documents):
-            try:
-                data = _prepare_insert_data(document)
-                if "_id" in data and _id_exists_in_table(conn, table, data["_id"]):
-                    errors.append({"index": i, "message": f"Duplicate _id: {data['_id']}"})
-                    continue
-                cur = conn.execute(
-                    f"INSERT INTO {_quote_ident(table)} (data) VALUES (?)",
-                    (json.dumps(data),),
-                )
-                row_id = cur.lastrowid
-                ids.append(row_id)
-                inserted_count += 1
-                infer_fields_from_document(conn, entity_id, data)
-            except Exception as e:
-                errors.append({"index": i, "message": str(e)})
-
-        if inserted_count:
-            conn.execute(
-                "UPDATE atlas_entities SET row_count = row_count + ?, updated_at = datetime('now') WHERE id = ?",
-                (inserted_count, entity_id),
-            )
-
-    if inserted_count:
-        refresh_world_stats(owner, world_id)
-
-    result: Dict[str, Any] = {"inserted_ids": ids, "inserted_count": inserted_count}
-    if errors:
-        result["errors"] = errors
-    return result
+    result = import_documents_bulk(owner, world_id, entity_id, documents, mode="append")
+    out: Dict[str, Any] = {
+        "inserted_ids": result.get("inserted_ids", []),
+        "inserted_count": result["rows_inserted"],
+    }
+    if result.get("errors"):
+        out["errors"] = result["errors"]
+    return out
 
 
 def update_one(

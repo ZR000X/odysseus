@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from services.atlas.ddl import create_entity_table, drop_entity_table, table_name_for_entity
 from services.atlas.fields import load_fields
+from services.atlas.names import assert_unique_atlas_name
 from services.atlas.world_db import open_world_db
 from services.atlas.worlds import AtlasNotFoundError, get_world
 
@@ -67,6 +68,25 @@ def get_entity(owner: Optional[str], world_id: str, entity_id: str) -> Dict[str,
         return _row_to_entity(row, load_fields(conn, entity_id))
 
 
+def get_entity_table(owner: Optional[str], world_id: str, entity_id: str) -> Dict[str, Any]:
+    """Lightweight entity lookup for bulk import (no field registry load)."""
+    world = get_world(owner, world_id)
+    with open_world_db(world["db_path"]) as conn:
+        row = conn.execute(
+            "SELECT id, name, table_name, row_count FROM atlas_entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        if not row:
+            raise AtlasNotFoundError(f"Entity not found: {entity_id}")
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "table_name": row["table_name"],
+            "row_count": row["row_count"] or 0,
+            "db_path": world["db_path"],
+        }
+
+
 def create_entity(
     owner: Optional[str],
     world_id: str,
@@ -81,13 +101,16 @@ def create_entity(
     now = _utcnow_iso()
 
     with open_world_db(world["db_path"]) as conn:
+        display_name = assert_unique_atlas_name(conn, name or "Untitled")
         create_entity_table(conn, table_name)
         conn.execute(
             """INSERT INTO atlas_entities
                (id, name, description, table_name, row_count, created_at, updated_at)
                VALUES (?, ?, ?, ?, 0, ?, ?)""",
-            (entity_id, name.strip() or "Untitled", description, table_name, now, now),
+            (entity_id, display_name, description, table_name, now, now),
         )
+        from services.atlas.keys import ensure_innate_key
+        ensure_innate_key(conn, entity_id)
 
     from services.atlas.worlds import refresh_world_stats
     refresh_world_stats(owner, world_id)
@@ -102,26 +125,44 @@ def update_entity(
     name: Optional[str] = None,
     description: Optional[str] = None,
 ) -> Dict[str, Any]:
-    get_entity(owner, world_id, entity_id)
+    existing = get_entity(owner, world_id, entity_id)
     world = get_world(owner, world_id)
     updates = []
     params: List[Any] = []
+    new_name: Optional[str] = None
+    old_name = existing["name"]
     if name is not None:
+        new_name = (name or "").strip() or "Untitled"
         updates.append("name = ?")
-        params.append(name.strip() or "Untitled")
+        params.append(new_name)
     if description is not None:
         updates.append("description = ?")
         params.append(description)
     if not updates:
-        return get_entity(owner, world_id, entity_id)
+        return existing
     updates.append("updated_at = ?")
     params.append(_utcnow_iso())
     params.append(entity_id)
     with open_world_db(world["db_path"]) as conn:
+        if new_name is not None:
+            assert_unique_atlas_name(conn, new_name, exclude_entity_id=entity_id)
         conn.execute(
             f"UPDATE atlas_entities SET {', '.join(updates)} WHERE id = ?",
             params,
         )
+        rename_pair = (
+            (old_name, new_name)
+            if new_name is not None and new_name != old_name
+            else None
+        )
+        conn.commit()
+    if rename_pair:
+        from services.atlas.queries import _propagate_source_rename
+        old, new = rename_pair
+        with open_world_db(world["db_path"]) as conn:
+            _propagate_source_rename(
+                conn, owner, world_id, entity_id, "entity", old, new,
+            )
     from services.atlas.worlds import refresh_world_stats
     refresh_world_stats(owner, world_id)
     return get_entity(owner, world_id, entity_id)
@@ -199,6 +240,7 @@ def delete_entity(owner: Optional[str], world_id: str, entity_id: str) -> bool:
     with open_world_db(world["db_path"]) as conn:
         drop_entity_table(conn, entity["table_name"])
         conn.execute("DELETE FROM atlas_fields WHERE entity_id = ?", (entity_id,))
+        conn.execute("DELETE FROM atlas_entity_keys WHERE entity_id = ?", (entity_id,))
         conn.execute("DELETE FROM atlas_canvas_nodes WHERE entity_id = ?", (entity_id,))
         conn.execute(
             "DELETE FROM atlas_relationships WHERE from_entity_id = ? OR to_entity_id = ?",

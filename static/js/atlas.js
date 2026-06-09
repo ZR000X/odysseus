@@ -2,7 +2,7 @@
  * Atlas — structured data worlds (canvas + compass).
  */
 import uiModule from './ui.js';
-import { mountCanvas, unmountCanvas } from './atlas-canvas.js';
+import { mountCanvas, unmountCanvas, updateEntityCard, reloadCanvasData } from './atlas-canvas.js';
 import { mountCompass, unmountCompass } from './atlas-compass.js';
 
 const API_BASE = window.location.origin;
@@ -14,6 +14,9 @@ let _selectedWorldId = null;
 let _view = 'canvas'; // canvas | compass
 let _compassEntityId = null;
 let _compassEntityName = '';
+let _compassKind = 'entity'; // entity | query
+let _canvasMounted = false;
+let _escHandler = null;
 
 async function _fetch(path, opts = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -58,64 +61,141 @@ function _playViewEnter(main, className) {
 
 function _setViewMode(mode) {
   document.body.classList.remove('atlas-canvas-mode', 'atlas-compass-mode');
-  if (mode === 'canvas') document.body.classList.add('atlas-canvas-mode');
-  else if (mode === 'compass') document.body.classList.add('atlas-compass-mode');
+  if (mode === 'canvas') {
+    document.body.classList.add('atlas-canvas-mode');
+  } else if (mode === 'compass') {
+    document.body.classList.add('atlas-canvas-mode', 'atlas-compass-mode');
+  }
 }
 
-function _showCanvas() {
+function _removeEscHandler() {
+  if (_escHandler) {
+    document.removeEventListener('keydown', _escHandler);
+    _escHandler = null;
+  }
+}
+
+function _destroyCompassOverlay() {
+  unmountCompass();
+  _removeEscHandler();
+  document.getElementById('atlas-compass-overlay')?.remove();
+}
+
+function _closeCompass() {
+  _destroyCompassOverlay();
   _view = 'canvas';
   _compassEntityId = null;
   _setViewMode('canvas');
+}
+
+function _wireCompassOverlay(overlay) {
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) _closeCompass();
+  });
+  _removeEscHandler();
+  _escHandler = (e) => {
+    if (e.key !== 'Escape') return;
+    if (document.querySelector('.atlas-modal, .modal:not(.hidden)')) return;
+    e.preventDefault();
+    _closeCompass();
+  };
+  document.addEventListener('keydown', _escHandler);
+}
+
+async function _ensureCanvasMounted() {
   const main = document.getElementById('atlas-main');
-  if (!main) return;
-  unmountCompass();
-  main.innerHTML = '';
+  if (!main || _canvasMounted) return;
   _playViewEnter(main, 'atlas-canvas-enter');
-  mountCanvas(main, {
+  const closeBtn = await mountCanvas(main, {
     worldId: _selectedWorldId,
     worlds: _worlds,
     entities: _entities,
-    onOpenEntity: (entityId, entityName) => _showCompass(entityId, entityName),
+    onOpenEntity: (entityId, entityName) => _showCompass(entityId, entityName, 'entity'),
+    onOpenQuery: (queryId, queryName) => _showCompass(queryId, queryName, 'query'),
     onWorldChange: async (wid) => {
       _selectedWorldId = wid;
       await _loadEntities();
     },
-  }).then(closeBtn => {
-    closeBtn?.addEventListener('click', () => closePanel());
   });
+  closeBtn?.addEventListener('click', () => closePanel());
+  _canvasMounted = true;
 }
 
-function _showCompass(entityId, entityName) {
-  _view = 'compass';
-  _setViewMode('compass');
-  _compassEntityId = entityId;
-  _compassEntityName = entityName;
-  const entity = _entities.find(e => e.id === entityId) || {
-    id: entityId,
-    name: entityName || 'Entity',
-    description: '',
-  };
-  const main = document.getElementById('atlas-main');
-  if (!main) return;
-  unmountCanvas();
-  main.innerHTML = '';
-  _playViewEnter(main, 'atlas-compass-enter');
-  mountCompass(main, {
+async function _showCanvas() {
+  _closeCompass();
+  _setViewMode('canvas');
+  await _ensureCanvasMounted();
+}
+
+function _mountCompassInOverlay(entityId, entityName, kind = 'entity') {
+  const entity = kind === 'query'
+    ? { id: entityId, name: entityName || 'Query', description: '' }
+    : (_entities.find(e => e.id === entityId) || {
+      id: entityId,
+      name: entityName || 'Entity',
+      description: '',
+    });
+  const pane = document.getElementById('atlas-pane');
+  if (!pane) return;
+
+  _destroyCompassOverlay();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'atlas-compass-overlay';
+  overlay.className = 'atlas-compass-overlay atlas-compass-enter';
+  overlay.innerHTML = '<div class="atlas-compass-modal" id="atlas-compass-mount"></div>';
+  pane.appendChild(overlay);
+  setTimeout(() => overlay.classList.remove('atlas-compass-enter'), VIEW_TRANSITION_MS);
+
+  const mountTarget = overlay.querySelector('#atlas-compass-mount');
+  _wireCompassOverlay(overlay);
+
+  mountCompass(mountTarget, {
     worldId: _selectedWorldId,
     entityId,
     entity,
     entityName: entity.name,
-    onBack: async () => {
-      await _loadEntities();
-      _showCanvas();
-    },
+    kind,
+    onBack: () => _closeCompass(),
     onEntityUpdated: (updated) => {
       const idx = _entities.findIndex(e => e.id === updated.id);
       if (idx >= 0) _entities[idx] = updated;
       else _entities.push(updated);
       _compassEntityName = updated.name;
+      updateEntityCard(updated.id, { name: updated.name });
     },
+    onEditQuery: kind === 'query' ? async () => {
+      const { promptQuery } = await import('./atlas-modals.js');
+      const catalog = await _fetch(`/api/atlas/worlds/${_selectedWorldId}/schema-catalog`);
+      const q = await _fetch(`/api/atlas/worlds/${_selectedWorldId}/queries`).then(d =>
+        (d.queries || []).find(x => x.id === entityId));
+      const data = await promptQuery({
+        worldId: _selectedWorldId,
+        catalog,
+        query: q,
+        onValidate: (sql, qid) => _fetch(`/api/atlas/worlds/${_selectedWorldId}/queries/validate`, {
+          method: 'POST',
+          body: JSON.stringify({ sql_text: sql, query_id: qid, preview_limit: 25 }),
+        }),
+      });
+      if (!data) return;
+      await _fetch(`/api/atlas/worlds/${_selectedWorldId}/queries/${entityId}`, {
+        method: 'PUT', body: JSON.stringify(data),
+      });
+      _compassEntityName = data.name;
+      _mountCompassInOverlay(entityId, data.name, 'query');
+    } : null,
   });
+}
+
+async function _showCompass(entityId, entityName, kind = 'entity') {
+  _view = 'compass';
+  _compassEntityId = entityId;
+  _compassEntityName = entityName;
+  _compassKind = kind;
+  _setViewMode('compass');
+  await _ensureCanvasMounted();
+  _mountCompassInOverlay(entityId, entityName, kind);
 }
 
 function _buildPane() {
@@ -135,10 +215,18 @@ function _buildPane() {
 async function _refresh() {
   await _loadWorlds();
   await _loadEntities();
+  if (_canvasMounted) {
+    await reloadCanvasData(_selectedWorldId, _worlds, _entities);
+  }
   if (_view === 'compass' && _compassEntityId) {
-    _showCompass(_compassEntityId, _compassEntityName);
+    if (!_compassEntityName) {
+      const ent = _entities.find(e => e.id === _compassEntityId);
+      _compassEntityName = ent?.name || 'Entity';
+    }
+    await _ensureCanvasMounted();
+    _mountCompassInOverlay(_compassEntityId, _compassEntityName, _compassKind);
   } else {
-    _showCanvas();
+    await _showCanvas();
   }
 }
 
@@ -147,6 +235,7 @@ export async function openPanel(opts = {}) {
   if (opts.entityId) {
     _view = 'compass';
     _compassEntityId = opts.entityId;
+    _compassEntityName = '';
   }
   if (!_open) {
     _buildPane();
@@ -156,10 +245,6 @@ export async function openPanel(opts = {}) {
   }
   try {
     await _refresh();
-    if (opts.entityId) {
-      const ent = _entities.find(e => e.id === opts.entityId);
-      _showCompass(opts.entityId, ent?.name || 'Entity');
-    }
   } catch (e) {
     uiModule.showError(e.message);
   }
@@ -167,8 +252,9 @@ export async function openPanel(opts = {}) {
 
 export function closePanel() {
   _open = false;
+  _destroyCompassOverlay();
   unmountCanvas();
-  unmountCompass();
+  _canvasMounted = false;
   document.getElementById('atlas-backdrop')?.remove();
   document.getElementById('tool-atlas-btn')?.classList.remove('active');
   document.body.classList.remove('atlas-view', 'atlas-canvas-mode', 'atlas-compass-mode');

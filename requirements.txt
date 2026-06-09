@@ -44,3 +44,4 @@ croniter
 pytest
 pytest-asyncio
 openpyxl
+sqlglot

@@ -39,49 +39,89 @@ def _merge_type(existing: str, new: str) -> str:
     return "mixed"
 
 
-def infer_fields_from_document(conn, entity_id: str, document: Dict[str, Any]) -> None:
-    """Update atlas_fields registry from a document's keys."""
+def infer_fields_from_documents(
+    conn,
+    entity_id: str,
+    documents: List[Dict[str, Any]],
+) -> None:
+    """Update atlas_fields registry from many documents in one pass."""
+    if not documents:
+        return
     now = _utcnow_iso()
-    total_docs = conn.execute(
-        "SELECT row_count FROM atlas_entities WHERE id = ?", (entity_id,)
-    ).fetchone()
-    doc_count = max(1, (total_docs[0] if total_docs else 0))
+    existing_rows = conn.execute(
+        "SELECT * FROM atlas_fields WHERE entity_id = ?",
+        (entity_id,),
+    ).fetchall()
+    registry: Dict[str, Dict[str, Any]] = {}
+    for row in existing_rows:
+        registry[row["slug"]] = {
+            "id": row["id"],
+            "inferred_type": row["inferred_type"],
+            "occurrence_count": row["occurrence_count"] or 0,
+            "nullable_ratio": row["nullable_ratio"] if row["nullable_ratio"] is not None else 1.0,
+            "is_new": False,
+        }
 
-    for key, value in document.items():
-        if key.startswith("_"):
-            continue
-        try:
-            slug = slugify(key)
-            validate_slug(slug)
-        except ValueError:
-            continue
-        itype = infer_type(value)
-        existing = conn.execute(
-            "SELECT * FROM atlas_fields WHERE entity_id = ? AND slug = ?",
-            (entity_id, slug),
-        ).fetchone()
-        if existing:
-            merged = _merge_type(existing["inferred_type"], itype)
-            occ = (existing["occurrence_count"] or 0) + 1
-            null_ratio = existing["nullable_ratio"] or 1.0
-            if value is not None:
-                null_ratio = ((null_ratio * (occ - 1)) + 0.0) / occ
-            conn.execute(
-                """UPDATE atlas_fields SET inferred_type = ?, occurrence_count = ?,
-                   nullable_ratio = ?, updated_at = ? WHERE id = ?""",
-                (merged, occ, null_ratio, now, existing["id"]),
-            )
-        else:
+    pending: Dict[str, Dict[str, Any]] = {}
+    for document in documents:
+        for key, value in document.items():
+            if key.startswith("_"):
+                continue
+            try:
+                slug = slugify(key)
+                validate_slug(slug)
+            except ValueError:
+                continue
+            itype = infer_type(value)
+            if slug not in pending:
+                if slug in registry:
+                    entry = registry[slug]
+                    pending[slug] = {
+                        "id": entry["id"],
+                        "inferred_type": entry["inferred_type"],
+                        "occurrence_count": entry["occurrence_count"],
+                        "null_count": entry["nullable_ratio"] * entry["occurrence_count"],
+                        "is_new": False,
+                    }
+                else:
+                    pending[slug] = {
+                        "id": str(uuid.uuid4()),
+                        "inferred_type": itype,
+                        "occurrence_count": 0,
+                        "null_count": 0.0,
+                        "is_new": True,
+                    }
+            entry = pending[slug]
+            entry["inferred_type"] = _merge_type(entry["inferred_type"], itype)
+            entry["occurrence_count"] += 1
+            if value is None:
+                entry["null_count"] += 1.0
+
+    for slug, entry in pending.items():
+        occ = entry["occurrence_count"]
+        null_ratio = entry["null_count"] / occ if occ else 1.0
+        if entry["is_new"]:
             conn.execute(
                 """INSERT INTO atlas_fields
                    (id, entity_id, slug, inferred_type, occurrence_count,
                     nullable_ratio, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    str(uuid.uuid4()), entity_id, slug, itype,
-                    0.0 if value is not None else 1.0, now, now,
+                    entry["id"], entity_id, slug, entry["inferred_type"],
+                    occ, null_ratio, now, now,
                 ),
             )
+        else:
+            conn.execute(
+                """UPDATE atlas_fields SET inferred_type = ?, occurrence_count = ?,
+                   nullable_ratio = ?, updated_at = ? WHERE id = ?""",
+                (entry["inferred_type"], occ, null_ratio, now, entry["id"]),
+            )
+
+
+def infer_fields_from_document(conn, entity_id: str, document: Dict[str, Any]) -> None:
+    """Update atlas_fields registry from a document's keys."""
+    infer_fields_from_documents(conn, entity_id, [document])
 
 
 def _sample_key_map(sample: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -159,10 +199,13 @@ def get_schema(
         conn, entity_id, include_stats=include_stats, include_sparse=include_sparse,
         sample_key_map=key_map,
     )
+    from services.atlas.keys import load_keys_for_entity
+    keys = load_keys_for_entity(conn, entity_id)
     return {
         "entity_id": entity_id,
         "entity_name": entity_name,
         "document_count": row_count,
         "fields": fields,
+        "keys": keys,
         "sample_document": sample,
     }

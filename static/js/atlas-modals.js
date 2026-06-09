@@ -6,6 +6,10 @@ import { makeWindowDraggable } from './windowDrag.js';
 import {
   parseCardinalities, edgeVisuals, cardinalityMarkerHtml, cardinalityOptionsHtml,
 } from './atlas-rel-cardinality.js';
+import { mountSqlEditor } from './atlas-sql-editor.js';
+import { fieldDisplayName, slugsDisplayNames } from './atlas-field-resolve.js';
+
+const API_BASE = window.location.origin;
 
 function _esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -280,7 +284,7 @@ function _appendModalFlowBalls(svg, ballsG, d, direction, color, pathUid) {
   }
 }
 
-function _updateModalConnectorFlow(svg, flowMode, color) {
+function _updateModalConnectorFlow(svg, flowMode, flowDirection, color) {
   svg.querySelectorAll('.atlas-edge-flow-track, .atlas-rel-modal-flow-balls').forEach(el => el.remove());
   const ballsG = document.createElementNS(REL_SVG_NS, 'g');
   ballsG.classList.add('atlas-rel-modal-flow-balls', 'atlas-edge-flow-balls');
@@ -293,7 +297,7 @@ function _updateModalConnectorFlow(svg, flowMode, color) {
     _appendModalFlowBalls(svg, ballsG, paths.first, 'forward', color, 'in-from');
     _appendModalFlowBalls(svg, ballsG, paths.second, 'reverse', color, 'in-to');
   } else {
-    _appendModalFlowBalls(svg, ballsG, paths.full, 'forward', color, 'fwd');
+    _appendModalFlowBalls(svg, ballsG, paths.full, flowDirection || 'forward', color, 'fwd');
   }
   svg.appendChild(ballsG);
 }
@@ -337,8 +341,9 @@ function _relationshipLayoutHtml(opts) {
         <label class="atlas-form-label">From cardinality${cardinalityOptionsHtml(fromCardinality, 'from')}</label>
         <label class="atlas-form-label">To cardinality${cardinalityOptionsHtml(toCardinality, 'to')}</label>
       </div>
-      <label class="atlas-form-label">From field <span class="atlas-filter-hint">(optional)</span><input class="atlas-form-input" id="atlas-rel-from-field" value="${_esc(fromField)}" placeholder="Inferred from data" /></label>
-      <label class="atlas-form-label">To field <span class="atlas-filter-hint">(optional)</span><input class="atlas-form-input" id="atlas-rel-to-field" value="${_esc(toField)}" placeholder="Inferred from data" /></label>
+      <label class="atlas-form-label">From key<select class="atlas-form-input" id="atlas-rel-from-key"><option value="">— select key —</option></select></label>
+      <label class="atlas-form-label">To key<select class="atlas-form-input" id="atlas-rel-to-key"><option value="">— select key —</option></select></label>
+      <p class="atlas-form-hint" id="atlas-rel-key-hint"></p>
       <label class="atlas-form-label">Label<input class="atlas-form-input" id="atlas-rel-label" value="${_esc(label)}" placeholder="Optional" /></label>
       ${anchorFields}
     </section>
@@ -347,11 +352,11 @@ function _relationshipLayoutHtml(opts) {
 
 function _updateRelModalVisuals(wrap, entities) {
   const { from, to } = _readModalCardinalities(wrap);
-  const { color, flowMode } = edgeVisuals(from, to);
+  const { color, flowMode, flowDirection } = edgeVisuals(from, to);
   const path = wrap.querySelector('.atlas-rel-connector-path');
   if (path) path.setAttribute('stroke', color);
   const svg = wrap.querySelector('.atlas-rel-connector-svg');
-  if (svg) _updateModalConnectorFlow(svg, flowMode, color);
+  if (svg) _updateModalConnectorFlow(svg, flowMode, flowDirection, color);
   wrap.querySelectorAll('.atlas-rel-entity-marker').forEach(host => {
     const end = host.dataset.end === 'from' ? 'from' : 'to';
     host.innerHTML = cardinalityMarkerHtml(end === 'from' ? from : to, end);
@@ -365,13 +370,71 @@ function _updateRelModalVisuals(wrap, entities) {
   if (bridge) bridge.style.setProperty('--atlas-rel-color', color);
 }
 
-function _wireRelationshipModal(wrap, entities) {
+async function _fetchKeys(worldId, entityId) {
+  if (!worldId || !entityId) return [];
+  const res = await fetch(`${API_BASE}/api/atlas/worlds/${worldId}/entities/${entityId}/keys`, { credentials: 'same-origin' });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.keys || [];
+}
+
+function _keyLabel(k, fields = []) {
+  const slugs = slugsDisplayNames(k.field_slugs, fields);
+  const innate = k.innate ? ' · innate' : '';
+  return `${k.name} (${slugs})${innate}`;
+}
+
+function _defaultKeyId(keys, entityId) {
+  if (!keys?.length) return '';
+  const innate = keys.find(k => k.innate || k.name === '_id');
+  return innate?.id || `innate-id:${entityId}`;
+}
+
+async function _fetchSchemaFields(worldId, entityId) {
+  if (!worldId || !entityId) return [];
+  const res = await fetch(`${API_BASE}/api/atlas/worlds/${worldId}/entities/${entityId}/schema`, { credentials: 'same-origin' });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.fields || [];
+}
+
+async function _populateKeySelect(sel, keys, selectedId, entityId = '', fields = []) {
+  if (!sel) return;
+  const resolvedId = selectedId || _defaultKeyId(keys, entityId);
+  sel.innerHTML = '<option value="">— select key —</option>' +
+    keys.map(k => `<option value="${_esc(k.id)}"${k.id === resolvedId ? ' selected' : ''}>${_esc(_keyLabel(k, fields))}</option>`).join('');
+}
+
+async function _refreshRelKeys(wrap, worldId, fromId, toId, fromKeyId, toKeyId) {
+  const fromSel = wrap.querySelector('#atlas-rel-from');
+  const toSel = wrap.querySelector('#atlas-rel-to');
+  const fid = fromSel?.value || fromId;
+  const tid = toSel?.value || toId;
+  const [fromKeys, toKeys, fromFields, toFields] = await Promise.all([
+    _fetchKeys(worldId, fid),
+    _fetchKeys(worldId, tid),
+    _fetchSchemaFields(worldId, fid),
+    _fetchSchemaFields(worldId, tid),
+  ]);
+  await _populateKeySelect(wrap.querySelector('#atlas-rel-from-key'), fromKeys, fromKeyId, fid, fromFields);
+  await _populateKeySelect(wrap.querySelector('#atlas-rel-to-key'), toKeys, toKeyId, tid, toFields);
+  const hint = wrap.querySelector('#atlas-rel-key-hint');
+  if (hint) {
+    hint.textContent = 'Each collection has an innate _id key. Composite keys join column-by-column in order.';
+  }
+}
+
+function _wireRelationshipModal(wrap, entities, { worldId, fromId, toId, fromKeyId, toKeyId } = {}) {
   wrap.querySelector('#atlas-rel-from-cardinality')?.addEventListener('change', () => _updateRelModalVisuals(wrap, entities));
   wrap.querySelector('#atlas-rel-to-cardinality')?.addEventListener('change', () => _updateRelModalVisuals(wrap, entities));
   wrap.querySelectorAll('.atlas-rel-entity-select').forEach(sel => {
-    sel.addEventListener('change', () => _updateRelModalVisuals(wrap, entities));
+    sel.addEventListener('change', async () => {
+      _updateRelModalVisuals(wrap, entities);
+      await _refreshRelKeys(wrap, worldId, fromId, toId);
+    });
   });
   _updateRelModalVisuals(wrap, entities);
+  _refreshRelKeys(wrap, worldId, fromId, toId, fromKeyId, toKeyId);
 }
 
 function _readRelationshipValues(wrap, fromIdFallback, toIdFallback, fromAnchor, toAnchor) {
@@ -381,8 +444,8 @@ function _readRelationshipValues(wrap, fromIdFallback, toIdFallback, fromAnchor,
     to_entity_id: wrap.querySelector('#atlas-rel-to')?.value || toIdFallback,
     from_cardinality: from,
     to_cardinality: to,
-    from_field: wrap.querySelector('#atlas-rel-from-field')?.value?.trim() || '',
-    to_field: wrap.querySelector('#atlas-rel-to-field')?.value?.trim() || '',
+    from_key_id: wrap.querySelector('#atlas-rel-from-key')?.value || '',
+    to_key_id: wrap.querySelector('#atlas-rel-to-key')?.value || '',
     label: wrap.querySelector('#atlas-rel-label')?.value?.trim() || '',
     from_anchor: wrap.querySelector('#atlas-rel-from-anchor')?.value || fromAnchor,
     to_anchor: wrap.querySelector('#atlas-rel-to-anchor')?.value || toAnchor,
@@ -442,7 +505,7 @@ function _mountRelationshipModal({
   });
 }
 
-export function promptRelationship(entities, fromId = '', toId = '', anchors = {}) {
+export function promptRelationship(entities, fromId = '', toId = '', anchors = {}, worldId = null) {
   const fromAnchor = anchors.from_anchor || 'e';
   const toAnchor = anchors.to_anchor || 'w';
   const bodyHtml = _relationshipLayoutHtml({
@@ -463,12 +526,16 @@ export function promptRelationship(entities, fromId = '', toId = '', anchors = {
     title: 'New Relationship',
     submitLabel: 'Create',
     bodyHtml,
-    onMount: (wrap) => _wireRelationshipModal(wrap, entities),
-    onSubmit: (wrap) => _readRelationshipValues(wrap, fromId, toId, fromAnchor, toAnchor),
+    onMount: (wrap) => _wireRelationshipModal(wrap, entities, { worldId, fromId, toId }),
+    onSubmit: (wrap) => {
+      const vals = _readRelationshipValues(wrap, fromId, toId, fromAnchor, toAnchor);
+      if (!vals.from_key_id || !vals.to_key_id) throw new Error('Select keys on both sides');
+      return vals;
+    },
   });
 }
 
-export function promptEditRelationship(rel, entities) {
+export function promptEditRelationship(rel, entities, worldId = null) {
   const { from, to } = parseCardinalities(rel);
   const bodyHtml = _relationshipLayoutHtml({
     entities,
@@ -489,7 +556,10 @@ export function promptEditRelationship(rel, entities) {
     footerSplit: true,
     footerExtra: '<button type="button" class="admin-btn-sm atlas-rel-delete" style="color:#dc2626">Delete</button>',
     onMount: (wrap, close) => {
-      _wireRelationshipModal(wrap, entities);
+      _wireRelationshipModal(wrap, entities, {
+        worldId, fromId: rel.from_entity_id, toId: rel.to_entity_id,
+        fromKeyId: rel.from_key_id, toKeyId: rel.to_key_id,
+      });
       wrap.querySelector('.atlas-rel-delete')?.addEventListener('click', async () => {
         const ok = await uiModule.styledConfirm('Delete this relationship?', { confirmText: 'Delete', danger: true });
         if (ok) close({ _delete: true });
@@ -497,14 +567,306 @@ export function promptEditRelationship(rel, entities) {
     },
     onSubmit: (wrap) => {
       const { from, to } = _readModalCardinalities(wrap);
+      const from_key_id = wrap.querySelector('#atlas-rel-from-key')?.value || '';
+      const to_key_id = wrap.querySelector('#atlas-rel-to-key')?.value || '';
+      if (!from_key_id || !to_key_id) throw new Error('Select keys on both sides');
       return {
         from_cardinality: from,
         to_cardinality: to,
-        from_field: wrap.querySelector('#atlas-rel-from-field')?.value?.trim() || '',
-        to_field: wrap.querySelector('#atlas-rel-to-field')?.value?.trim() || '',
+        from_key_id,
+        to_key_id,
         label: wrap.querySelector('#atlas-rel-label')?.value?.trim() || '',
       };
     },
+  });
+}
+
+function _buildKeyFieldPool(fields) {
+  const bySlug = new Map();
+  for (const f of fields || []) {
+    if (f?.slug) {
+      bySlug.set(f.slug, {
+        slug: f.slug,
+        sample_key: f.sample_key,
+        inferred_type: f.inferred_type || 'text',
+      });
+    }
+  }
+  if (!bySlug.has('_id')) {
+    bySlug.set('_id', { slug: '_id', sample_key: '_id', inferred_type: 'id' });
+  }
+  return [...bySlug.values()].sort((a, b) => fieldDisplayName(a).localeCompare(fieldDisplayName(b)));
+}
+
+function _mountKeyModal({ title, submitLabel, bodyHtml, onSubmit, onMount }) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal atlas-modal';
+    wrap.innerHTML = `
+      <div class="modal-content atlas-modal-content atlas-key-modal-content">
+        <div class="modal-header">
+          <h4>${_esc(title)}</h4>
+          <button type="button" class="close-btn atlas-modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body atlas-modal-body">${bodyHtml}</div>
+        <div class="modal-footer atlas-modal-footer">
+          <div style="display:flex;gap:8px;margin-left:auto">
+            <button type="button" class="admin-btn-sm atlas-modal-cancel">Cancel</button>
+            <button type="button" class="admin-btn-sm atlas-modal-submit">${_esc(submitLabel)}</button>
+          </div>
+        </div>
+      </div>`;
+    const close = (val) => { wrap.remove(); resolve(val); };
+    wrap.querySelector('.atlas-modal-close')?.addEventListener('click', () => close(null));
+    wrap.querySelector('.atlas-modal-cancel')?.addEventListener('click', () => close(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) close(null); });
+    const submitBtn = wrap.querySelector('.atlas-modal-submit');
+    submitBtn?.addEventListener('click', async () => {
+      try {
+        const val = await onSubmit(wrap);
+        if (val !== false) close(val);
+      } catch (err) {
+        uiModule.showError(err.message || String(err));
+      }
+    });
+    _wireModalEnterSubmit(wrap, submitBtn);
+    document.body.appendChild(wrap);
+    onMount?.(wrap);
+    const content = wrap.querySelector('.modal-content');
+    const header = wrap.querySelector('.modal-header');
+    if (content && header) {
+      makeWindowDraggable(wrap, {
+        content,
+        header,
+        skipSelector: 'button, input, select, textarea, label',
+        enableDock: true,
+      });
+    }
+    wrap.querySelector('#atlas-key-name')?.focus();
+  });
+}
+
+function _wireKeyFieldPicker(wrap, fieldPool, initialSlugs = []) {
+  const poolBySlug = new Map(fieldPool.map(f => [f.slug, f]));
+  let selectedSlugs = (initialSlugs || []).filter(slug => poolBySlug.has(slug));
+  let searchQuery = '';
+
+  const previewEl = wrap.querySelector('#atlas-key-preview');
+  const availableEl = wrap.querySelector('#atlas-key-available');
+  const selectedEl = wrap.querySelector('#atlas-key-selected');
+  const searchEl = wrap.querySelector('#atlas-key-search');
+
+  function _updatePreview() {
+    if (!previewEl) return;
+    if (!selectedSlugs.length) {
+      previewEl.textContent = 'Select fields below — order defines composite key columns';
+      previewEl.classList.add('atlas-key-preview-empty');
+      return;
+    }
+    previewEl.textContent = slugsDisplayNames(selectedSlugs, fieldPool);
+    previewEl.classList.remove('atlas-key-preview-empty');
+  }
+
+  function _matchesSearch(field) {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    const display = fieldDisplayName(field).toLowerCase();
+    return display.includes(q)
+      || field.slug.toLowerCase().includes(q)
+      || (field.inferred_type || '').toLowerCase().includes(q);
+  }
+
+  function _renderAvailable() {
+    if (!availableEl) return;
+    const selectedSet = new Set(selectedSlugs);
+    const available = fieldPool.filter(f => !selectedSet.has(f.slug) && _matchesSearch(f));
+    if (!available.length) {
+      availableEl.innerHTML = `<div class="atlas-key-panel-empty">${searchQuery ? 'No matching fields' : 'All fields selected'}</div>`;
+      return;
+    }
+    availableEl.innerHTML = available.map(f => `
+      <div class="atlas-key-available-row" data-slug="${_esc(f.slug)}">
+        <span class="atlas-key-row-slug">${_esc(fieldDisplayName(f))}</span>
+        <span class="atlas-schema-field-type">${_esc(f.inferred_type)}</span>
+        <button type="button" class="admin-btn-sm atlas-key-add-field" data-slug="${_esc(f.slug)}" title="Add field" aria-label="Add ${_esc(fieldDisplayName(f))}">+</button>
+      </div>`).join('');
+  }
+
+  function _renderSelected() {
+    if (!selectedEl) return;
+    if (!selectedSlugs.length) {
+      selectedEl.innerHTML = '<div class="atlas-key-panel-empty">No fields selected</div>';
+      return;
+    }
+    selectedEl.innerHTML = selectedSlugs.map((slug, idx) => {
+      const f = poolBySlug.get(slug) || { slug, inferred_type: 'text' };
+      const upDisabled = idx === 0 ? ' disabled' : '';
+      const downDisabled = idx === selectedSlugs.length - 1 ? ' disabled' : '';
+      return `
+        <div class="atlas-key-selected-row" data-slug="${_esc(slug)}">
+          <span class="atlas-key-pos">${idx + 1}</span>
+          <span class="atlas-key-row-slug">${_esc(fieldDisplayName(f))}</span>
+          <span class="atlas-schema-field-type">${_esc(f.inferred_type)}</span>
+          <div class="atlas-key-selected-actions">
+            <button type="button" class="atlas-link-btn atlas-key-move-up" data-slug="${_esc(slug)}" title="Move up"${upDisabled}>↑</button>
+            <button type="button" class="atlas-link-btn atlas-key-move-down" data-slug="${_esc(slug)}" title="Move down"${downDisabled}>↓</button>
+            <button type="button" class="atlas-link-btn atlas-key-remove-field" data-slug="${_esc(slug)}" title="Remove">×</button>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  function _render() {
+    _updatePreview();
+    _renderAvailable();
+    _renderSelected();
+  }
+
+  searchEl?.addEventListener('input', () => {
+    searchQuery = searchEl.value.trim();
+    _renderAvailable();
+  });
+
+  availableEl?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.atlas-key-add-field');
+    if (!btn) return;
+    const slug = btn.dataset.slug;
+    if (!slug || selectedSlugs.includes(slug)) return;
+    selectedSlugs.push(slug);
+    _render();
+  });
+
+  selectedEl?.addEventListener('click', (e) => {
+    const removeBtn = e.target.closest('.atlas-key-remove-field');
+    if (removeBtn) {
+      const slug = removeBtn.dataset.slug;
+      selectedSlugs = selectedSlugs.filter(s => s !== slug);
+      _render();
+      return;
+    }
+    const upBtn = e.target.closest('.atlas-key-move-up');
+    if (upBtn && !upBtn.disabled) {
+      const idx = selectedSlugs.indexOf(upBtn.dataset.slug);
+      if (idx > 0) {
+        [selectedSlugs[idx - 1], selectedSlugs[idx]] = [selectedSlugs[idx], selectedSlugs[idx - 1]];
+        _render();
+      }
+      return;
+    }
+    const downBtn = e.target.closest('.atlas-key-move-down');
+    if (downBtn && !downBtn.disabled) {
+      const idx = selectedSlugs.indexOf(downBtn.dataset.slug);
+      if (idx >= 0 && idx < selectedSlugs.length - 1) {
+        [selectedSlugs[idx], selectedSlugs[idx + 1]] = [selectedSlugs[idx + 1], selectedSlugs[idx]];
+        _render();
+      }
+    }
+  });
+
+  _render();
+
+  return {
+    getSelectedSlugs: () => [...selectedSlugs],
+  };
+}
+
+export function promptKey(fields, existing = null) {
+  const isEdit = !!existing;
+  const fieldPool = _buildKeyFieldPool(fields);
+  const bodyHtml = `
+    <label class="atlas-form-label">Name
+      <input type="text" class="atlas-form-input" id="atlas-key-name" value="${_esc(existing?.name || '')}" placeholder="customer_key" />
+    </label>
+    <div class="atlas-form-label atlas-key-preview-label">Composite preview</div>
+    <div id="atlas-key-preview" class="atlas-key-preview atlas-key-preview-empty">Select fields below — order defines composite key columns</div>
+    <div class="atlas-key-panels">
+      <div class="atlas-key-panel">
+        <div class="atlas-key-panel-title">Available</div>
+        <input type="search" class="atlas-form-input atlas-key-search" id="atlas-key-search" placeholder="Filter fields…" autocomplete="off" />
+        <div id="atlas-key-available" class="atlas-key-panel-list"></div>
+      </div>
+      <div class="atlas-key-panel">
+        <div class="atlas-key-panel-title">Selected <span class="atlas-filter-hint">order = composite columns</span></div>
+        <div id="atlas-key-selected" class="atlas-key-panel-list"></div>
+      </div>
+    </div>`;
+
+  let picker = null;
+  return _mountKeyModal({
+    title: isEdit ? 'Edit Key' : 'New Key',
+    submitLabel: isEdit ? 'Save' : 'Create',
+    bodyHtml,
+    onMount: (wrap) => {
+      picker = _wireKeyFieldPicker(wrap, fieldPool, existing?.field_slugs || []);
+    },
+    onSubmit: (wrap) => {
+      const name = wrap.querySelector('#atlas-key-name')?.value?.trim();
+      if (!name) throw new Error('Name is required');
+      const slugs = picker?.getSelectedSlugs() || [];
+      if (!slugs.length) throw new Error('Select at least one field');
+      return { name, field_slugs: slugs };
+    },
+  });
+}
+
+export function promptQuery({ worldId, catalog, query = null, onValidate }) {
+  const isEdit = !!query;
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal atlas-modal';
+    wrap.innerHTML = `
+      <div class="modal-content atlas-modal-content atlas-query-modal" id="atlas-query-modal-content">
+        <div class="modal-header">
+          <h4>${isEdit ? 'Edit Query' : 'New Query'}</h4>
+          <button type="button" class="close-btn atlas-modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body atlas-modal-body atlas-query-modal-body">
+          <label class="atlas-form-label">Name<input type="text" class="atlas-form-input" id="atlas-query-name" value="${_esc(query?.name || '')}" placeholder="Active customers" /></label>
+          <div id="atlas-query-sql-mount" class="atlas-query-workspace"></div>
+        </div>
+        <div class="modal-footer atlas-modal-footer">
+          <button type="button" class="admin-btn-sm atlas-modal-cancel">Cancel</button>
+          <button type="button" class="admin-btn-sm atlas-modal-submit">${isEdit ? 'Save' : 'Create'}</button>
+        </div>
+      </div>`;
+    const close = (val) => { editor?.destroy(); wrap.remove(); resolve(val); };
+    wrap.querySelector('.atlas-modal-close')?.addEventListener('click', () => close(null));
+    wrap.querySelector('.atlas-modal-cancel')?.addEventListener('click', () => close(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) close(null); });
+    let editor = null;
+    const mount = wrap.querySelector('#atlas-query-sql-mount');
+    editor = mountSqlEditor(mount, {
+      catalog,
+      initialSql: query?.sql_text || 'SELECT * FROM ',
+      onValidate: (sql) => onValidate(sql, query?.id),
+    });
+    wrap.querySelector('.atlas-modal-submit')?.addEventListener('click', async () => {
+      try {
+        const name = wrap.querySelector('#atlas-query-name')?.value?.trim();
+        const sql_text = editor.getSql().trim();
+        if (!name) throw new Error('Name is required');
+        if (!sql_text) throw new Error('SQL is required');
+        close({ name, sql_text });
+      } catch (err) {
+        uiModule.showError(err.message || String(err));
+      }
+    });
+    document.body.appendChild(wrap);
+    const content = wrap.querySelector('.modal-content');
+    const header = wrap.querySelector('.modal-header');
+    if (content && header) {
+      makeWindowDraggable(wrap, {
+        content, header,
+        skipSelector: 'button, input, select, textarea, label',
+        enableDock: true,
+        minWidth: 720,
+        minHeight: 480,
+        resizeStorageKey: 'winsize-atlas-query-modal',
+      });
+      content.style.maxWidth = 'none';
+      content.style.maxHeight = 'none';
+    }
+    wrap.querySelector('#atlas-query-name')?.focus();
   });
 }
 

@@ -48,3 +48,14 @@ export function docGetField(doc, slug, index = null) {
   if (key == null) return { key: null, value: undefined, has: false };
   return { key, value: doc[key], has: true };
 }
+
+/** @param {{ slug?: string, sample_key?: string }|null|undefined} field */
+export function fieldDisplayName(field) {
+  return field?.sample_key || field?.slug || '';
+}
+
+/** @param {string[]} slugs @param {{ slug?: string, sample_key?: string }[]} fields */
+export function slugsDisplayNames(slugs, fields) {
+  const bySlug = new Map((fields || []).map(f => [f.slug, fieldDisplayName(f)]));
+  return (slugs || []).map(s => bySlug.get(s) || s).join(' + ');
+}

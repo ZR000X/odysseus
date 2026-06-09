@@ -72,27 +72,38 @@ def _compile_field_clause(key: str, val: Any) -> Tuple[str, List[Any]]:
     return "json_extract(data, ?) = ?", [path, json.dumps(val) if isinstance(val, (dict, list)) else val]
 
 
-def compile_filter(filter_obj: Optional[Dict[str, Any]] = None) -> Tuple[str, List[Any]]:
+def compile_filter(
+    filter_obj: Optional[Dict[str, Any]] = None,
+    *,
+    extra_where: str = "",
+    extra_params: Optional[List[Any]] = None,
+) -> Tuple[str, List[Any]]:
     """
     Compile MongoDB-style filter to SQL WHERE clause.
     Supports _id / _atlas_row_id, dotted json paths, and $in/$contains/$ne/$gt/$gte/$lt/$lte.
     Returns (where_sql, params) — empty where if no filter.
+    extra_where: additional AND clause (without leading WHERE/AND).
     """
     if not filter_obj:
-        return "", []
+        filter_obj = {}
 
     clauses: List[str] = []
-    params: List[Any] = []
+    params: List[Any] = list(extra_params or [])
 
     for key, val in filter_obj.items():
+        if key == "$keyViolation":
+            continue  # handled by caller via extra_where
         if key.startswith("$"):
             raise ValueError(f"Unsupported filter operator at top level: {key}")
         clause, clause_params = _compile_field_clause(key, val)
         clauses.append(clause)
         params.extend(clause_params)
 
+    if extra_where:
+        clauses.append(f"({extra_where})")
+
     if not clauses:
-        return "", []
+        return "", params if extra_params else []
     return " WHERE " + " AND ".join(clauses), params
 
 

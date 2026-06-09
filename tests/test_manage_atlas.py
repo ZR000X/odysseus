@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -65,13 +66,18 @@ def atlas_env(tmp_path, monkeypatch):
     _load_atlas_module("fields", "fields.py")
     _load_atlas_module("query", "query.py")
     worlds_mod = _load_atlas_module("worlds", "worlds.py")
+    _load_atlas_module("names", "names.py")
     entities_mod = _load_atlas_module("entities", "entities.py")
     documents_mod = _load_atlas_module("documents", "documents.py")
     rows_mod = _load_atlas_module("rows", "rows.py")
     csv_mod = _load_atlas_module("csv_io", "csv_io.py")
     clusters_mod = _load_atlas_module("clusters", "clusters.py")
-    canvas_mod = _load_atlas_module("canvas", "canvas.py")
+    keys_mod = _load_atlas_module("keys", "keys.py")
+    key_violations_mod = _load_atlas_module("key_violations", "key_violations.py")
+    sql_engine_mod = _load_atlas_module("sql_engine", "sql_engine.py")
+    queries_mod = _load_atlas_module("queries", "queries.py")
     rels_mod = _load_atlas_module("relationships", "relationships.py")
+    canvas_mod = _load_atlas_module("canvas", "canvas.py")
     search_mod = _load_atlas_module("search", "search.py")
 
     yield {
@@ -87,6 +93,10 @@ def atlas_env(tmp_path, monkeypatch):
         "clusters": clusters_mod,
         "ddl": ddl,
         "search": search_mod,
+        "keys": keys_mod,
+        "key_violations": key_violations_mod,
+        "sql_engine": sql_engine_mod,
+        "queries": queries_mod,
     }
 
 
@@ -185,6 +195,65 @@ async def test_import_merge(atlas_env):
     csv1 = "name,email\nAlice,a@x.com\nBob,b@x.com\n"
     atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv1, mode="append")
     assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_import_merge_updates_existing(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    csv1 = "name,email\nAlice,a@x.com\nBob,b@x.com\n"
+    stats = atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv1, mode="append")
+    assert stats["rows_inserted"] == 2
+
+    exported = atlas_env["csv"].export_csv(atlas_env["owner"], w["id"], e["id"])
+    csv2 = exported.replace("a@x.com", "alice@x.com").rstrip() + "\nCarol,c@x.com\n"
+    stats2 = atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv2, mode="merge")
+    assert stats2["rows_updated"] >= 1
+    assert stats2["rows_inserted"] >= 1
+    assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 3
+
+    alice = atlas_env["documents"].find_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alice"},
+    )
+    assert alice["email"] == "alice@x.com"
+
+
+@pytest.mark.asyncio
+async def test_import_rows_populates_field_registry(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    csv_text = "name,qty\nWidget,5\nGadget,10\n"
+    atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv_text, mode="append")
+    schema = atlas_env["documents"].get_entity_schema(atlas_env["owner"], w["id"], e["id"])
+    slugs = {f["slug"] for f in schema["fields"]}
+    assert "name" in slugs
+    assert "qty" in slugs
+
+
+@pytest.mark.asyncio
+async def test_import_rows_bulk_performance(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Bulk")
+    rows = ["name,value"] + [f"item{i},{i}" for i in range(200)]
+    csv_text = "\n".join(rows) + "\n"
+    start = time.perf_counter()
+    stats = atlas_env["csv"].import_rows(atlas_env["owner"], w["id"], e["id"], csv_text, mode="append")
+    elapsed = time.perf_counter() - start
+    assert stats["rows_inserted"] == 200
+    assert stats["rows_failed"] == 0
+    assert elapsed < 2.0
+    assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 200
+
+
+@pytest.mark.asyncio
+async def test_insert_many_uses_bulk_path(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Docs")
+    docs = [{"name": f"n{i}", "value": i} for i in range(50)]
+    result = atlas_env["documents"].insert_many(atlas_env["owner"], w["id"], e["id"], docs)
+    assert result["inserted_count"] == 50
+    assert len(result["inserted_ids"]) == 50
+    assert atlas_env["documents"].count_documents(atlas_env["owner"], w["id"], e["id"]) == 50
 
 
 @pytest.mark.asyncio
@@ -357,6 +426,26 @@ async def test_canvas_cluster_roundtrip(atlas_env):
 
 
 @pytest.mark.asyncio
+async def test_delete_entity(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], a["id"], {"name": "test"})
+    atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many", "", "",
+    )
+    atlas_env["entities"].delete_entity(atlas_env["owner"], w["id"], a["id"])
+    remaining = atlas_env["entities"].list_entities(atlas_env["owner"], w["id"])
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == b["id"]
+    rels = atlas_env["relationships"].list_relationships(atlas_env["owner"], w["id"])
+    assert len(rels) == 0
+    layout = atlas_env["canvas"].get_layout(atlas_env["owner"], w["id"])
+    assert all(n["entity_id"] != a["id"] for n in layout["nodes"])
+
+
+@pytest.mark.asyncio
 async def test_delete_cluster_reparents(atlas_env):
     w = atlas_env["worlds"].create_world(atlas_env["owner"], "Test")
     e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
@@ -514,7 +603,7 @@ def test_legacy_world_db_gets_v3_tables(atlas_env):
         ver = conn.execute(
             "SELECT value FROM atlas_meta WHERE key='schema_version'"
         ).fetchone()[0]
-        assert int(ver) == 3
+        assert int(ver) == 6
 
 
 def _tool_env_patch(atlas_env, monkeypatch):
@@ -801,6 +890,7 @@ async def test_app_api_blocks_atlas(monkeypatch):
     }), owner="testuser")
     assert r["exit_code"] == 1
     assert "manage_atlas" in r["error"]
+    assert "not separate tools" in r["error"].lower() or "actions inside" in r["error"].lower()
 
 
 @pytest.mark.asyncio
@@ -818,3 +908,407 @@ async def test_get_schema_sparse_filter(atlas_env):
     assert "noise" not in slugs
     sku_field = next(f for f in schema["fields"] if f["slug"] == "sku")
     assert sku_field["nullable_ratio"] == 0.0
+
+
+def test_legacy_world_db_gets_v4_tables(atlas_env):
+    """Opening a pre-v4 world DB adds keys, queries, and relationship key columns."""
+    wdb = sys.modules["services.atlas.world_db"]
+    legacy_path = atlas_env["worlds_dir"] / "legacy-v4.db"
+    conn = sqlite3.connect(legacy_path)
+    conn.executescript("""
+        CREATE TABLE atlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO atlas_meta VALUES ('schema_version', '3');
+        CREATE TABLE atlas_entities (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
+            table_name TEXT NOT NULL UNIQUE, row_count INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE atlas_relationships (
+            id TEXT PRIMARY KEY, from_entity_id TEXT NOT NULL, to_entity_id TEXT NOT NULL,
+            rel_type TEXT NOT NULL, from_field TEXT NOT NULL, to_field TEXT NOT NULL,
+            label TEXT DEFAULT '', from_anchor TEXT DEFAULT 'right', to_anchor TEXT DEFAULT 'left',
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+    """)
+    conn.close()
+
+    with wdb.open_world_db(str(legacy_path)) as conn:
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "atlas_entity_keys" in tables
+        assert "atlas_queries" in tables
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(atlas_relationships)").fetchall()}
+        assert "from_key_id" in cols
+        assert "to_key_id" in cols
+        ver = conn.execute(
+            "SELECT value FROM atlas_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert int(ver) == 6
+
+
+def test_partial_v5_world_repairs_relationship_key_columns(atlas_env):
+    """schema_version 5 but missing key columns still gets repaired on open."""
+    wdb = sys.modules["services.atlas.world_db"]
+    legacy_path = atlas_env["worlds_dir"] / "partial-v5.db"
+    conn = sqlite3.connect(legacy_path)
+    conn.executescript("""
+        CREATE TABLE atlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO atlas_meta VALUES ('schema_version', '5');
+        CREATE TABLE atlas_entities (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
+            table_name TEXT NOT NULL UNIQUE, row_count INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE atlas_entity_keys (
+            id TEXT PRIMARY KEY, entity_id TEXT NOT NULL, name TEXT NOT NULL,
+            field_slugs TEXT NOT NULL DEFAULT '[]',
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE atlas_relationships (
+            id TEXT PRIMARY KEY, from_entity_id TEXT NOT NULL, to_entity_id TEXT NOT NULL,
+            rel_type TEXT NOT NULL, from_field TEXT NOT NULL, to_field TEXT NOT NULL,
+            label TEXT DEFAULT '', from_anchor TEXT DEFAULT 'right', to_anchor TEXT DEFAULT 'left',
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+    """)
+    conn.close()
+
+    with wdb.open_world_db(str(legacy_path)) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(atlas_relationships)").fetchall()}
+        assert "from_key_id" in cols
+        assert "to_key_id" in cols
+
+
+@pytest.mark.asyncio
+async def test_keys_crud_and_violations(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Keys")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"sku": "A1"})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"sku": "A1"})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"sku": "B2"})
+
+    key = atlas_env["keys"].create_key(
+        atlas_env["owner"], w["id"], e["id"], "sku_key", ["sku"],
+    )
+    assert key["name"] == "sku_key"
+
+    schema = atlas_env["documents"].get_entity_schema(atlas_env["owner"], w["id"], e["id"])
+    assert any(k["id"] == key["id"] for k in schema.get("keys", []))
+
+    n = atlas_env["key_violations"].count_key_violations(
+        atlas_env["owner"], w["id"], e["id"], key["id"],
+    )
+    assert n == 2
+
+    result = atlas_env["documents"].find(
+        atlas_env["owner"], w["id"], e["id"],
+        filter_obj={"$keyViolation": key["id"]},
+    )
+    assert result["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_key_violations_with_display_key_name(atlas_env):
+    """Document keys that slugify differently must still detect duplicates."""
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "DisplayKeys")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Parts")
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"Part Number": "A1"})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"Part Number": "A1"})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], e["id"], {"Part Number": "B2"})
+
+    schema = atlas_env["documents"].get_entity_schema(atlas_env["owner"], w["id"], e["id"])
+    part_field = next(f for f in schema["fields"] if f["slug"] == "part_number")
+    assert part_field["sample_key"] == "Part Number"
+
+    key = atlas_env["keys"].create_key(
+        atlas_env["owner"], w["id"], e["id"], "part_key", ["part_number"],
+    )
+    n = atlas_env["key_violations"].count_key_violations(
+        atlas_env["owner"], w["id"], e["id"], key["id"],
+    )
+    assert n == 2
+
+    result = atlas_env["documents"].find(
+        atlas_env["owner"], w["id"], e["id"],
+        filter_obj={"$keyViolation": key["id"]},
+    )
+    assert result["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_innate_id_key_on_empty_collection(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Innate")
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+
+    keys_a = atlas_env["keys"].list_keys(atlas_env["owner"], w["id"], a["id"])
+    innate_a = next(k for k in keys_a if k.get("innate"))
+    assert innate_a["name"] == "_id"
+    assert innate_a["field_slugs"] == ["_id"]
+
+    rel = atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many",
+        from_key_id=innate_a["id"],
+        to_key_id=atlas_env["keys"].innate_key_id(b["id"]),
+    )
+    assert rel["from_key"]["name"] == "_id"
+    assert rel["to_key"]["name"] == "_id"
+
+    n = atlas_env["key_violations"].count_key_violations(
+        atlas_env["owner"], w["id"], a["id"], innate_a["id"],
+    )
+    assert n == 0
+
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        atlas_env["keys"].delete_key(
+            atlas_env["owner"], w["id"], a["id"], innate_a["id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_key_based_relationship(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Rels")
+    a = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "A")
+    b = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "B")
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], a["id"], {"id": 1})
+    atlas_env["documents"].insert_one(atlas_env["owner"], w["id"], b["id"], {"ref": 1})
+    ka = atlas_env["keys"].create_key(atlas_env["owner"], w["id"], a["id"], "pk", ["id"])
+    kb = atlas_env["keys"].create_key(atlas_env["owner"], w["id"], b["id"], "fk", ["ref"])
+    rel = atlas_env["relationships"].create_relationship(
+        atlas_env["owner"], w["id"],
+        a["id"], b["id"], "one_to_many",
+        from_key_id=ka["id"], to_key_id=kb["id"],
+    )
+    assert rel["from_key"]["name"] == "pk"
+    assert rel["to_key"]["name"] == "fk"
+
+
+@pytest.mark.asyncio
+async def test_sql_validate_incomplete_query(atlas_env):
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Validate")
+    result = atlas_env["queries"].validate_sql_text(
+        atlas_env["owner"], w["id"], "SELECT * FROM ",
+    )
+    assert result["valid"] is False
+    assert "parse error" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_sql_query_execute(atlas_env):
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "SQL")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alice", "status": "active"},
+    )
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Bob", "status": "inactive"},
+    )
+    q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Active",
+        "SELECT name FROM Customers WHERE status = 'active'",
+    )
+    result = atlas_env["queries"].execute_query(atlas_env["owner"], w["id"], q["id"])
+    assert result["total"] == 1
+    assert result["documents"][0]["name"] == "Alice"
+    assert len(q["dependencies"]) == 1
+    assert q["dependencies"][0]["source_type"] == "entity"
+
+
+@pytest.mark.asyncio
+async def test_sql_query_execute_original_document_keys(atlas_env):
+    """Documents may store original keys while field slugs differ."""
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "SQLKeys")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Products")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"],
+        {"Part Number": "ABC-123", "Deal ID": 42},
+    )
+    q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "AllProducts",
+        "SELECT * FROM Products",
+    )
+    result = atlas_env["queries"].execute_query(atlas_env["owner"], w["id"], q["id"])
+    assert result["total"] == 1
+    doc = result["documents"][0]
+    assert doc["part_number"] == "ABC-123"
+    assert doc["deal_id"] == 42
+
+    preview = atlas_env["queries"].validate_sql_text(
+        atlas_env["owner"], w["id"], "SELECT * FROM Products", preview_limit=10,
+    )
+    assert preview["valid"] is True
+    assert preview["preview"]["documents"][0]["part_number"] == "ABC-123"
+
+
+@pytest.mark.asyncio
+async def test_sql_query_special_column_names(atlas_env):
+    """Columns with spaces/symbols resolve via original document keys."""
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "SQLSpecial")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Parts")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"],
+        {"Part #": "X-100", "Deal ID": 7},
+    )
+    result = atlas_env["queries"].validate_sql_text(
+        atlas_env["owner"], w["id"],
+        "SELECT b.`Part #`, b.`Deal ID` FROM Parts AS b",
+        preview_limit=10,
+    )
+    assert result["valid"] is True, result.get("error")
+    doc = result["preview"]["documents"][0]
+    assert doc["part"] == "X-100"
+    assert doc["deal_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_canvas_query_nodes_roundtrip(atlas_env):
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Canvas")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "E1")
+    pytest.importorskip("sqlglot")
+    q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Q1", "SELECT * FROM E1",
+    )
+    layout = atlas_env["canvas"].save_layout(
+        atlas_env["owner"], w["id"],
+        nodes=[], query_nodes=[{
+            "query_id": q["id"], "x": 10, "y": 20, "w": 200, "h": 120,
+        }],
+    )
+    assert len(layout["query_nodes"]) == 1
+    assert layout["query_nodes"][0]["query_id"] == q["id"]
+
+
+@pytest.mark.asyncio
+async def test_sql_macro_query_join_table(atlas_env):
+    """$('Name') references a saved query joined with a collection."""
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "MacroJoin")
+    missing = atlas_env["entities"].create_entity(
+        atlas_env["owner"], w["id"], "SIT - Missing Part Numbers on our Products",
+    )
+    products = atlas_env["entities"].create_entity(
+        atlas_env["owner"], w["id"], "SIT_Siebel_BRM_Products",
+    )
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], missing["id"],
+        {"product_name": "Widget", "part_number": "PN-1"},
+    )
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], products["id"],
+        {"name": "Widget", "part": "PART-A"},
+    )
+    base_q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Missing Parts",
+        'SELECT product_name, part_number FROM $("SIT - Missing Part Numbers on our Products")',
+    )
+    join_q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Joined",
+        'SELECT x.part_number, y.part FROM $("Missing Parts") x '
+        'JOIN SIT_Siebel_BRM_Products y ON x.product_name = y.name',
+    )
+    result = atlas_env["queries"].execute_query(atlas_env["owner"], w["id"], join_q["id"])
+    assert result["total"] == 1
+    assert result["documents"][0]["part_number"] == "PN-1"
+    assert result["documents"][0]["part"] == "PART-A"
+    assert len(base_q["dependencies"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_sql_macro_query_on_query(atlas_env):
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "MacroChain")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Items")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"name": "Alpha", "qty": 3},
+    )
+    q1 = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Active Items",
+        "SELECT name, qty FROM Items WHERE qty > 0",
+    )
+    q2 = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Doubled",
+        'SELECT name, qty * 2 AS doubled FROM $("Active Items")',
+    )
+    result = atlas_env["queries"].execute_query(atlas_env["owner"], w["id"], q2["id"])
+    assert result["total"] == 1
+    assert result["documents"][0]["doubled"] == 6
+    assert q2["dependencies"][0]["source_id"] == q1["id"]
+
+
+@pytest.mark.asyncio
+async def test_query_rename_propagates_to_dependents(atlas_env):
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "RenameQ")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Src")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"val": 1},
+    )
+    q_a = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Query A", "SELECT val FROM Src",
+    )
+    q_b = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Query B",
+        'SELECT val FROM $("Query A") UNION SELECT val FROM `Query A`',
+    )
+    atlas_env["queries"].update_query(
+        atlas_env["owner"], w["id"], q_a["id"], name="Query Alpha",
+    )
+    updated_b = atlas_env["queries"].get_query(atlas_env["owner"], w["id"], q_b["id"])
+    assert '$("Query Alpha")' in updated_b["sql_text"]
+    assert "`Query Alpha`" in updated_b["sql_text"]
+    result = atlas_env["queries"].execute_query(atlas_env["owner"], w["id"], q_b["id"])
+    assert result["total"] == 1
+    assert result["documents"][0]["val"] == 1
+
+
+@pytest.mark.asyncio
+async def test_entity_rename_propagates_to_dependents(atlas_env):
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "RenameE")
+    e = atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "OldName")
+    atlas_env["documents"].insert_one(
+        atlas_env["owner"], w["id"], e["id"], {"x": 9},
+    )
+    q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Uses Entity",
+        'SELECT x FROM $("OldName") UNION SELECT x FROM OldName',
+    )
+    atlas_env["entities"].update_entity(
+        atlas_env["owner"], w["id"], e["id"], name="NewName",
+    )
+    updated_q = atlas_env["queries"].get_query(atlas_env["owner"], w["id"], q["id"])
+    assert '$("NewName")' in updated_q["sql_text"]
+    assert "FROM NewName" in updated_q["sql_text"]
+    result = atlas_env["queries"].execute_query(atlas_env["owner"], w["id"], q["id"])
+    assert result["total"] == 1
+    assert result["documents"][0]["x"] == 9
+
+
+@pytest.mark.asyncio
+async def test_atlas_name_uniqueness_cross_type(atlas_env):
+    pytest.importorskip("sqlglot")
+    w = atlas_env["worlds"].create_world(atlas_env["owner"], "Unique")
+    atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "Customers")
+    with pytest.raises(ValueError, match="already used by collection"):
+        atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "customers")
+    with pytest.raises(ValueError, match="already used by collection"):
+        atlas_env["queries"].create_query(
+            atlas_env["owner"], w["id"], "Customers", "SELECT 1",
+        )
+    q = atlas_env["queries"].create_query(
+        atlas_env["owner"], w["id"], "Active", "SELECT 1",
+    )
+    with pytest.raises(ValueError, match="already used by query"):
+        atlas_env["entities"].create_entity(atlas_env["owner"], w["id"], "active")
+    with pytest.raises(ValueError, match="already used by collection"):
+        atlas_env["queries"].update_query(
+            atlas_env["owner"], w["id"], q["id"], name="Customers",
+        )

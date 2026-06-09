@@ -55,3 +55,19 @@ def test_plain_tell_request_stays_minimal():
     assert not (_EMAIL_TOOLS & tools)
     # Always-available baseline is still there.
     assert set(ALWAYS_AVAILABLE) <= tools
+
+
+def test_atlas_query_join_forces_manage_atlas():
+    """Follow-up join requests must surface manage_atlas, not only app_api."""
+    ti = _index_without_embeddings()
+    tools = ti.get_tools_for_query(
+        "modify the query to join SIT_Siebel_BRM_Products to SIT_Deal_Products"
+    )
+    assert "manage_atlas" in tools
+    assert "app_api" in tools  # always-on baseline
+
+
+def test_bms_world_mention_forces_manage_atlas():
+    ti = _index_without_embeddings()
+    tools = ti.get_tools_for_query("check out the BMS world in Atlas")
+    assert "manage_atlas" in tools

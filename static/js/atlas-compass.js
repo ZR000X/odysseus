@@ -7,10 +7,11 @@ import {
   renderListView, renderJsonView, renderTableView,
   wireScrollDelegation, expandAllChevrons,
 } from './atlas-compass-views.js';
-import { promptAddDocument, promptImportJson, promptEditDocument, normalizeImportDocuments } from './atlas-modals.js';
+import { fieldDisplayName, slugsDisplayNames } from './atlas-field-resolve.js';
+import { promptAddDocument, promptImportJson, promptEditDocument, normalizeImportDocuments, promptKey, promptQuery } from './atlas-modals.js';
 import {
   toastFilterMatch, toastImportedCsv, toastImportedJson, toastDocumentAdded,
-  toastCsvExported, toastRefreshed, toastBackOnMap, toastViewMode, toastAllLoaded,
+  toastCsvExported, toastRefreshed, toastViewMode, toastAllLoaded,
   toastCopied, toastDocumentUpdated, toastDocumentDeleted, toastDocumentsDeleted, toastImporting,
 } from './atlas-toast.js';
 
@@ -21,6 +22,9 @@ let _container = null;
 let _worldId = null;
 let _entityId = null;
 let _entity = null;
+let _kind = 'entity'; // entity | query
+let _cachedKeys = [];
+let _onEditQuery = null;
 let _filter = {};
 let _viewMode = 'list';
 let _cachedDocs = [];
@@ -192,6 +196,14 @@ async function _applyFilter() {
   toastFilterMatch(_totalDocs);
 }
 
+async function _applyKeyViolationFilter(keyId) {
+  const filterInput = _container?.querySelector('#atlas-compass-filter');
+  if (!filterInput || !keyId) return;
+  filterInput.value = JSON.stringify({ $keyViolation: keyId });
+  _updateFilterValidity();
+  await _applyFilter();
+}
+
 function _scheduleFilterApply() {
   clearTimeout(_filterDebounce);
   _filterDebounce = setTimeout(() => _applyFilter(), FILTER_DEBOUNCE_MS);
@@ -212,7 +224,10 @@ async function _fetchPage(append = false) {
   _fetchAbort = new AbortController();
 
   try {
-    const res = await fetch(`${API_BASE}/api/atlas/worlds/${_worldId}/entities/${_entityId}/find`, {
+    const findPath = _kind === 'query'
+      ? `/api/atlas/worlds/${_worldId}/queries/${_entityId}/find`
+      : `/api/atlas/worlds/${_worldId}/entities/${_entityId}/find`;
+    const res = await fetch(`${API_BASE}${findPath}`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
@@ -255,21 +270,71 @@ function _wireSentinel() {
   _scrollObserver.observe(sentinel);
 }
 
+async function _loadKeyViolationCounts() {
+  const counts = {};
+  await Promise.all((_cachedKeys || []).map(async (k) => {
+    try {
+      const data = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/keyViolations/count`, {
+        method: 'POST', body: JSON.stringify({ key_id: k.id }),
+      });
+      counts[k.id] = data.count || 0;
+    } catch { counts[k.id] = 0; }
+  }));
+  return counts;
+}
+
 async function _loadSchema(sidebar) {
   if (!sidebar || !_worldId || !_entityId) return;
   try {
-    const schema = await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/schema`);
+    const schemaPath = _kind === 'query'
+      ? `/api/atlas/worlds/${_worldId}/queries/${_entityId}/schema`
+      : `/api/atlas/worlds/${_worldId}/entities/${_entityId}/schema`;
+    const schema = await _fetch(schemaPath);
     _cachedFields = schema.fields || [];
+    _cachedKeys = schema.keys || [];
     _sampleDocument = schema.sample_document || null;
+    let keysHtml = '';
+    if (_cachedKeys.length) {
+      const violCounts = _kind === 'entity' ? await _loadKeyViolationCounts() : {};
+      const addKeyBtn = _kind === 'entity'
+        ? '<button type="button" class="admin-btn-sm atlas-btn-press atlas-key-add-btn" id="atlas-key-add">+ Key</button>'
+        : '';
+      keysHtml = `
+        <div class="atlas-compass-schema-title atlas-compass-keys-title">Keys</div>
+        ${addKeyBtn}
+        ${(_cachedKeys).map(k => {
+          const slugs = slugsDisplayNames(k.field_slugs, _cachedFields);
+          const isInnate = !!k.innate;
+          const dup = isInnate ? 0 : (violCounts[k.id] || 0);
+          const hasDups = dup > 0;
+          const dupBadge = hasDups
+            ? `<button type="button" class="atlas-key-dup-badge" data-key-id="${_esc(k.id)}" title="Show duplicates">dup: ${dup}</button>`
+            : '<span class="atlas-key-unique-badge" title="No duplicates">unique ✓</span>';
+          const innateBadge = isInnate ? '<span class="atlas-key-innate-badge" title="Built-in row id">innate</span>' : '';
+          const actions = isInnate ? '' : `<div class="atlas-key-actions">
+              <button type="button" class="atlas-link-btn atlas-key-edit" data-key-id="${_esc(k.id)}">Edit</button>
+              <button type="button" class="atlas-link-btn atlas-key-delete" data-key-id="${_esc(k.id)}">Delete</button>
+            </div>`;
+          return `<div class="atlas-key-row${isInnate ? ' atlas-key-row-innate' : ''}${hasDups ? ' atlas-key-row-dups' : ''}" data-key-id="${_esc(k.id)}"${hasDups ? ' data-has-dups="1" title="Click to show duplicates"' : ''}>
+            <div class="atlas-key-row-head">
+              <span class="atlas-key-name">${_esc(k.name)}</span>
+              ${innateBadge}
+              ${dupBadge}
+            </div>
+            <div class="atlas-key-slugs">${_esc(slugs)}</div>
+            ${actions}
+          </div>`;
+        }).join('')}`;
+    }
     sidebar.innerHTML = `
       <div class="atlas-compass-schema-title">Schema</div>
       <div class="atlas-compass-schema-count">${schema.document_count} documents</div>
       ${(_cachedFields).map(f => `
         <div class="atlas-schema-field" data-field="${_esc(f.slug)}" data-sample-key="${_esc(f.sample_key || f.slug)}" title="Click to filter">
-          <span class="atlas-schema-field-name">${_esc(f.slug)}</span>
+          <span class="atlas-schema-field-name">${_esc(fieldDisplayName(f))}</span>
           <span class="atlas-schema-field-type">${_esc(f.inferred_type)}</span>
         </div>`).join('') || '<div class="atlas-empty">No fields yet</div>'}
-    `;
+      ${keysHtml}`;
     if (_viewMode === 'table') _renderDocs(false);
   } catch (e) {
     sidebar.innerHTML = `<div class="atlas-empty">${_esc(e.message)}</div>`;
@@ -396,8 +461,7 @@ function _wireEntityHeader() {
 }
 
 function _wire() {
-  _container?.querySelector('#atlas-compass-back')?.addEventListener('click', () => {
-    toastBackOnMap();
+  _container?.querySelector('#atlas-compass-close')?.addEventListener('click', () => {
     if (_onBack) _onBack();
   });
 
@@ -424,7 +488,41 @@ function _wire() {
   _container?.querySelector('#atlas-compass-apply')?.addEventListener('click', () => _applyFilter());
   _container?.querySelector('#atlas-compass-delete-many')?.addEventListener('click', () => _deleteMatching());
 
-  _container?.querySelector('#atlas-compass-schema')?.addEventListener('click', (e) => {
+  _container?.querySelector('#atlas-compass-schema')?.addEventListener('click', async (e) => {
+    const dupBtn = e.target.closest('.atlas-key-dup-badge');
+    if (dupBtn) {
+      await _applyKeyViolationFilter(dupBtn.dataset.keyId);
+      return;
+    }
+    const dupRow = e.target.closest('.atlas-key-row[data-has-dups="1"]');
+    if (dupRow && !e.target.closest('.atlas-key-edit, .atlas-key-delete, .atlas-key-actions')) {
+      await _applyKeyViolationFilter(dupRow.dataset.keyId);
+      return;
+    }
+    const editBtn = e.target.closest('.atlas-key-edit');
+    if (editBtn) {
+      const key = _cachedKeys.find(k => k.id === editBtn.dataset.keyId);
+      if (!key) return;
+      const data = await promptKey(_cachedFields, key);
+      if (!data) return;
+      try {
+        await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/keys/${key.id}`, {
+          method: 'PUT', body: JSON.stringify(data),
+        });
+        await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+      } catch (err) { uiModule.showError(err.message); }
+      return;
+    }
+    const delBtn = e.target.closest('.atlas-key-delete');
+    if (delBtn) {
+      const ok = await uiModule.styledConfirm('Delete this key?', { confirmText: 'Delete', danger: true });
+      if (!ok) return;
+      try {
+        await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/keys/${delBtn.dataset.keyId}`, { method: 'DELETE' });
+        await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+      } catch (err) { uiModule.showError(err.message); }
+      return;
+    }
     const field = e.target.closest('.atlas-schema-field');
     if (!field || !filterInput) return;
     let obj = {};
@@ -433,6 +531,18 @@ function _wire() {
     obj[filterKey] = '';
     filterInput.value = JSON.stringify(obj);
     _updateFilterValidity();
+  });
+
+  _container?.querySelector('#atlas-compass-schema')?.addEventListener('click', async (e) => {
+    if (e.target.id !== 'atlas-key-add') return;
+    const data = await promptKey(_cachedFields);
+    if (!data) return;
+    try {
+      await _fetch(`/api/atlas/worlds/${_worldId}/entities/${_entityId}/keys`, {
+        method: 'POST', body: JSON.stringify(data),
+      });
+      await _loadSchema(_container?.querySelector('#atlas-compass-schema'));
+    } catch (err) { uiModule.showError(err.message); }
   });
 
   _container?.querySelector('#atlas-compass-export')?.addEventListener('click', () => {
@@ -510,11 +620,13 @@ function _wire() {
 }
 
 export function mountCompass(container, {
-  worldId, entityId, entity, entityName, onBack, onEntityUpdated,
+  worldId, entityId, entity, entityName, kind = 'entity', onBack, onEntityUpdated, onEditQuery,
 }) {
   _container = container;
   _worldId = worldId;
   _entityId = entityId;
+  _kind = kind;
+  _onEditQuery = onEditQuery || null;
   _entity = entity || { id: entityId, name: entityName || 'Entity', description: '' };
   _filter = {};
   _viewMode = 'list';
@@ -529,18 +641,21 @@ export function mountCompass(container, {
     <div class="atlas-compass atlas-chrome atlas-compass-enter">
       <div class="atlas-compass-sticky">
         <div class="atlas-compass-toolbar">
-          <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-back">← Canvas</button>
           <div class="atlas-compass-entity-header">
-            <div class="atlas-inline-field atlas-inline-name" data-field="name" tabindex="0">${_esc(_entity.name)}</div>
-            <div class="atlas-inline-field atlas-inline-desc" data-field="description" tabindex="0">${_esc(_entity.description || '')}</div>
+            ${_kind === 'query' ? `<span class="atlas-query-chip">QUERY</span>` : ''}
+            <div class="atlas-inline-field atlas-inline-name${_kind === 'query' ? ' atlas-inline-static' : ''}" data-field="name" tabindex="0">${_esc(_entity.name)}</div>
+            ${_kind === 'entity' ? `<div class="atlas-inline-field atlas-inline-desc" data-field="description" tabindex="0">${_esc(_entity.description || '')}</div>` : ''}
           </div>
           <div class="atlas-compass-toolbar-actions">
-            <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-add-doc">+ Document</button>
-            <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-import-csv">Import CSV</button>
-            <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-import-json">Import JSON</button>
-            <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-export">Export CSV</button>
+            ${_kind === 'query'
+              ? '<button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-edit-query">Edit query</button>'
+              : `<button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-add-doc">+ Document</button>
+                 <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-import-csv">Import CSV</button>
+                 <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-import-json">Import JSON</button>
+                 <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-export">Export CSV</button>`}
             <button type="button" class="admin-btn-sm atlas-btn-press" id="atlas-compass-refresh">Refresh</button>
           </div>
+          <button type="button" class="admin-btn-sm atlas-btn-press atlas-compass-close" id="atlas-compass-close" title="Close" aria-label="Close">×</button>
         </div>
         <div class="atlas-compass-filter-bar">
           <label>Filter <span class="atlas-filter-hint">JSON · Enter to apply</span></label>
@@ -571,9 +686,14 @@ export function mountCompass(container, {
     </div>`;
 
   _wire();
-  _wireEntityHeader();
+  if (_kind === 'entity') _wireEntityHeader();
+  if (_kind === 'query') {
+    _container?.querySelector('#atlas-compass-edit-query')?.addEventListener('click', () => {
+      if (_onEditQuery) _onEditQuery();
+    });
+  }
   _wireScrollActions();
-  if (!_entity.description) {
+  if (_kind === 'entity' && !_entity.description) {
     const descEl = _container.querySelector('.atlas-inline-desc');
     if (descEl && !descEl.textContent.trim()) {
       descEl.classList.add('atlas-inline-empty');

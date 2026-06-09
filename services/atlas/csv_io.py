@@ -4,12 +4,10 @@ from __future__ import annotations
 import csv
 import io
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from services.atlas import documents as atlas_documents
 from services.atlas.entities import get_entity
-from services.atlas.world_db import open_world_db
-from services.atlas.worlds import get_world, refresh_world_stats
 
 
 def export_csv(owner: Optional[str], world_id: str, entity_id: str) -> str:
@@ -34,6 +32,27 @@ def export_csv(owner: Optional[str], world_id: str, entity_id: str) -> str:
     return buf.getvalue()
 
 
+def _parse_csv_documents(csv_text: str) -> List[Dict[str, Any]]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    if not reader.fieldnames:
+        raise ValueError("CSV has no header row")
+
+    documents: List[Dict[str, Any]] = []
+    for raw in reader:
+        row_data = {
+            k: v for k, v in raw.items()
+            if k and k not in ("_atlas_row_id",)
+        }
+        row_id_raw = (raw.get("_atlas_row_id") or raw.get("_id") or "").strip()
+        if row_id_raw and "_id" not in row_data:
+            row_data["_id"] = int(row_id_raw) if row_id_raw.isdigit() else row_id_raw
+        doc: Dict[str, Any] = dict(row_data)
+        if row_id_raw:
+            doc["_import_merge_id"] = int(row_id_raw) if row_id_raw.isdigit() else row_id_raw
+        documents.append(doc)
+    return documents
+
+
 def import_rows(
     owner: Optional[str],
     world_id: str,
@@ -44,61 +63,21 @@ def import_rows(
     mode = (mode or "append").lower()
     if mode not in ("append", "merge", "replace"):
         raise ValueError("mode must be append, merge, or replace")
-    entity = get_entity(owner, world_id, entity_id)
-    world = get_world(owner, world_id)
-    table = entity["table_name"]
 
-    reader = csv.DictReader(io.StringIO(csv_text))
-    if not reader.fieldnames:
-        raise ValueError("CSV has no header row")
+    documents = _parse_csv_documents(csv_text)
+    result = atlas_documents.import_documents_bulk(
+        owner, world_id, entity_id, documents, mode=mode,
+    )
 
     stats = {
-        "rows_total": 0,
-        "rows_inserted": 0,
-        "rows_updated": 0,
-        "rows_skipped": 0,
-        "rows_failed": 0,
-        "errors": [],
+        "rows_total": result["rows_total"],
+        "rows_inserted": result["rows_inserted"],
+        "rows_updated": result["rows_updated"],
+        "rows_skipped": result["rows_skipped"],
+        "rows_failed": result["rows_failed"],
+        "errors": [
+            {"row": err["index"] + 2, "message": err["message"]}
+            for err in result.get("errors", [])
+        ],
     }
-
-    if mode == "replace":
-        with open_world_db(world["db_path"]) as conn:
-            conn.execute(f'DELETE FROM "{table}"')
-            conn.execute(
-                "UPDATE atlas_entities SET row_count = 0, updated_at = datetime('now') WHERE id = ?",
-                (entity_id,),
-            )
-
-    for i, raw in enumerate(reader):
-        stats["rows_total"] += 1
-        row_data = {
-            k: v for k, v in raw.items()
-            if k and k not in ("_atlas_row_id",)
-        }
-        row_id_raw = (raw.get("_atlas_row_id") or raw.get("_id") or "").strip()
-        if row_id_raw and "_id" not in row_data:
-            row_data["_id"] = int(row_id_raw) if row_id_raw.isdigit() else row_id_raw
-        try:
-            if mode == "merge" and row_id_raw:
-                filter_id = int(row_id_raw) if row_id_raw.isdigit() else row_id_raw
-                result = atlas_documents.update_one(
-                    owner, world_id, entity_id,
-                    {"_id": filter_id}, row_data,
-                )
-                if result.get("modified_count") or result.get("matched_count"):
-                    stats["rows_updated"] += 1
-                else:
-                    atlas_documents.insert_one(owner, world_id, entity_id, row_data)
-                    stats["rows_inserted"] += 1
-                continue
-            if row_data or mode == "append":
-                atlas_documents.insert_one(owner, world_id, entity_id, row_data)
-                stats["rows_inserted"] += 1
-            else:
-                stats["rows_skipped"] += 1
-        except Exception as e:
-            stats["rows_failed"] += 1
-            stats["errors"].append({"row": i + 2, "message": str(e)})
-
-    refresh_world_stats(owner, world_id)
     return stats

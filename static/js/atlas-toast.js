@@ -29,6 +29,10 @@ export function toastCollectionUpdated() {
   uiModule.showToast('Collection updated.', CHECK);
 }
 
+export function toastCollectionDeleted() {
+  uiModule.showToast('Collection deleted.', CHECK);
+}
+
 export function toastClusterCreated() {
   uiModule.showToast('Cluster ringfenced.', CHECK);
 }

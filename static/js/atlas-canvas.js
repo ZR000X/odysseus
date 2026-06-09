@@ -5,15 +5,18 @@ import uiModule from './ui.js';
 import {
   promptEntity, promptRelationship, promptEditRelationship,
   promptWorld, promptEditEntity, openWorldsManager,
-  promptCluster, promptEditCluster, promptTypeToConfirm,
+  promptCluster, promptEditCluster, promptTypeToConfirm, promptQuery,
 } from './atlas-modals.js';
 import { exportWorldExcel, openWorldExcelImportWizard } from './atlas-world-excel.js';
-import { parseCardinalities, edgeVisuals, renderCardinalityMarker } from './atlas-rel-cardinality.js';
+import {
+  parseCardinalities, edgeVisuals, renderCardinalityMarker, updateCardinalityMarkerPlacement,
+} from './atlas-rel-cardinality.js';
 import {
   toastBrowsing, toastWorldCreated, toastCollectionCreated, toastCollectionUpdated,
   toastConnectionLocked, toastWorldSwitched, toastSaved,
   toastWorldArchived, toastWorldRestored, toastWorldDeleted, toastWorldRenamed,
   toastWorldExported, toastWorldImported, toastClusterCreated, toastClusterUpdated,
+  toastCollectionDeleted,
 } from './atlas-toast.js';
 
 const API_BASE = window.location.origin;
@@ -29,6 +32,7 @@ const DEFAULT_CARD_W = 200;
 const DEFAULT_CARD_H = 120;
 const MIN_CARD_W = 120;
 const MIN_CARD_H = 72;
+const RESIZE_DIRS = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
 
 let _container = null;
 let _worldId = null;
@@ -36,11 +40,15 @@ let _worlds = [];
 let _entities = [];
 let _relationships = [];
 let _nodes = [];
+let _queryNodes = [];
+let _queries = [];
 let _clusters = [];
+let _planeFocus = { collections: true, queries: true };
 let _panX = 0;
 let _panY = 0;
 let _zoom = 1;
 let _onOpenEntity = null;
+let _onOpenQuery = null;
 let _onWorldChange = null;
 let _saveTimer = null;
 let _portDrag = null;
@@ -51,6 +59,11 @@ let _selectedRelId = null;
 let _labelEditor = null;
 let _edgesWired = false;
 let _selectedClusterId = null;
+let _interactionDepth = 0;
+let _interactionMovedEntities = new Set();
+let _interactionMovedQueries = new Set();
+let _lastDropTargetId = undefined;
+let _lastDropCardEl = null;
 
 async function _fetch(path, opts = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -77,6 +90,12 @@ function _scheduleSave() {
       const payload = {
         nodes: _nodes.map(n => ({
           entity_id: n.entity_id,
+          x: n.x, y: n.y, w: n.w, h: n.h,
+          z_index: n.z_index || 0,
+          cluster_id: n.cluster_id || null,
+        })),
+        query_nodes: _queryNodes.map(n => ({
+          query_id: n.query_id,
           x: n.x, y: n.y, w: n.w, h: n.h,
           z_index: n.z_index || 0,
           cluster_id: n.cluster_id || null,
@@ -111,33 +130,75 @@ function _normalizeAnchor(anchor) {
   return legacy[a] || a;
 }
 
-function _portPosition(entityId, anchor) {
-  const n = _nodeForEntity(entityId);
-  if (!n) return { x: 0, y: 0 };
+function _anchorIsVertical(anchor) {
+  const a = _normalizeAnchor(anchor);
+  return a === 'n' || a === 's' || a.startsWith('n') || a.startsWith('s');
+}
+
+function _nodePortPosition(node, anchor) {
+  if (!node) return { x: 0, y: 0 };
   const key = _normalizeAnchor(anchor);
-  const cx = n.x + n.w / 2;
-  const cy = n.y + n.h / 2;
+  const w = node.w || DEFAULT_CARD_W;
+  const h = node.h || DEFAULT_CARD_H;
+  const cx = node.x + w / 2;
+  const cy = node.y + h / 2;
   switch (key) {
-    case 'n': return { x: cx, y: n.y };
-    case 'ne': return { x: n.x + n.w, y: n.y };
-    case 'e': return { x: n.x + n.w, y: cy };
-    case 'se': return { x: n.x + n.w, y: n.y + n.h };
-    case 's': return { x: cx, y: n.y + n.h };
-    case 'sw': return { x: n.x, y: n.y + n.h };
-    case 'w': return { x: n.x, y: cy };
-    case 'nw': return { x: n.x, y: n.y };
+    case 'n': return { x: cx, y: node.y };
+    case 'ne': return { x: node.x + w, y: node.y };
+    case 'e': return { x: node.x + w, y: cy };
+    case 'se': return { x: node.x + w, y: node.y + h };
+    case 's': return { x: cx, y: node.y + h };
+    case 'sw': return { x: node.x, y: node.y + h };
+    case 'w': return { x: node.x, y: cy };
+    case 'nw': return { x: node.x, y: node.y };
     default: return { x: cx, y: cy };
   }
 }
 
-function _edgeMidpoint(from, to) {
-  const mx = (from.x + to.x) / 2;
+function _portPosition(entityId, anchor) {
+  return _nodePortPosition(_nodeForEntity(entityId), anchor);
+}
+
+function _edgeMidpoint(from, to, p1, p2) {
   const t = 0.5;
   const u = 1 - t;
   return {
-    x: u ** 3 * from.x + 3 * u ** 2 * t * mx + 3 * u * t ** 2 * mx + t ** 3 * to.x,
-    y: u ** 3 * from.y + 3 * u ** 2 * t * from.y + 3 * u * t ** 2 * to.y + t ** 3 * to.y,
+    x: u ** 3 * from.x + 3 * u ** 2 * t * p1.x + 3 * u * t ** 2 * p2.x + t ** 3 * to.x,
+    y: u ** 3 * from.y + 3 * u ** 2 * t * p1.y + 3 * u * t ** 2 * p2.y + t ** 3 * to.y,
   };
+}
+
+function _routeAxis(from, to, fromAnchor, toAnchor) {
+  const fromV = fromAnchor != null && _anchorIsVertical(fromAnchor);
+  const toV = toAnchor != null && _anchorIsVertical(toAnchor);
+  const fromH = fromAnchor != null && !_anchorIsVertical(fromAnchor);
+  const toH = toAnchor != null && !_anchorIsVertical(toAnchor);
+  if (fromV && toV) return 'vertical';
+  if (fromH && toH) return 'horizontal';
+  if (fromAnchor != null && toAnchor == null) return fromV ? 'vertical' : 'horizontal';
+  if (fromAnchor == null && toAnchor != null) return toV ? 'vertical' : 'horizontal';
+  const dx = Math.abs(to.x - from.x);
+  const dy = Math.abs(to.y - from.y);
+  return dy > dx ? 'vertical' : 'horizontal';
+}
+
+function _computeEdgeRoute(from, to, fromAnchor, toAnchor) {
+  const axis = _routeAxis(from, to, fromAnchor, toAnchor);
+  const mx = (from.x + to.x) / 2;
+  const my = (from.y + to.y) / 2;
+  let p1;
+  let p2;
+  let d;
+  if (axis === 'vertical') {
+    p1 = { x: from.x, y: my };
+    p2 = { x: to.x, y: my };
+    d = `M ${from.x} ${from.y} C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${to.x} ${to.y}`;
+  } else {
+    p1 = { x: mx, y: from.y };
+    p2 = { x: mx, y: to.y };
+    d = `M ${from.x} ${from.y} C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${to.x} ${to.y}`;
+  }
+  return { d, p1, p2, mid: _edgeMidpoint(from, to, p1, p2), mx, my, axis };
 }
 
 function _lerpPt(a, b, t) {
@@ -237,13 +298,11 @@ function _updateFlowPaths(group, r, geom) {
   group.querySelectorAll('.atlas-edge-flow-track, .atlas-edge-flow-balls').forEach(el => el.remove());
   if (_selectedRelId === r.id) return;
   const delay = _animDelay(r.id);
-  const { d, color, from, to, mx } = geom;
+  const { d, color, from, to, p1, p2 } = geom;
   const p0 = from;
-  const p1 = { x: mx, y: from.y };
-  const p2 = { x: mx, y: to.y };
   const p3 = to;
   const { from: fromC, to: toC } = parseCardinalities(r);
-  const { flowMode } = edgeVisuals(fromC, toC);
+  const { flowMode, flowDirection } = edgeVisuals(fromC, toC);
   if (flowMode === 'many_many') {
     const split = _splitCubicBezier(p0, p1, p2, p3, 0.5);
     _appendFlowBalls(group, split.second, 'forward', color, delay, `${r.id}-out-to`);
@@ -253,34 +312,191 @@ function _updateFlowPaths(group, r, geom) {
     _appendFlowBalls(group, split.first, 'forward', color, delay, `${r.id}-in-from`);
     _appendFlowBalls(group, split.second, 'reverse', color, delay, `${r.id}-in-to`);
   } else {
-    _appendFlowBalls(group, d, 'forward', color, delay, `${r.id}-fwd`);
+    _appendFlowBalls(group, d, flowDirection || 'forward', color, delay, `${r.id}-fwd`);
   }
 }
 
 function _edgeGeometry(r) {
   const from = _portPosition(r.from_entity_id, r.from_anchor);
   const to = _portPosition(r.to_entity_id, r.to_anchor);
-  const mx = (from.x + to.x) / 2;
-  const d = `M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}`;
+  const route = _computeEdgeRoute(from, to, r.from_anchor, r.to_anchor);
   const { from: fromC, to: toC } = parseCardinalities(r);
   const { color } = edgeVisuals(fromC, toC);
-  const fromUx = Math.sign(mx - from.x) || 1;
-  const toUx = Math.sign(to.x - mx) || 1;
-  return {
-    d, color, mid: _edgeMidpoint(from, to), from, to, mx,
-    fromAngle: fromUx > 0 ? 0 : Math.PI,
-    toAngle: toUx > 0 ? 0 : Math.PI,
-  };
+  return { ...route, color, from, to };
 }
 
-function _markerPlacement(from, to, mx, end) {
+function _markerPlacement(from, to, route, end, anchor) {
   const offset = 10;
+  if (_anchorIsVertical(anchor)) {
+    if (end === 'from') {
+      const uy = Math.sign(route.my - from.y) || 1;
+      return { x: from.x, y: from.y + uy * offset, angle: uy > 0 ? Math.PI / 2 : -Math.PI / 2 };
+    }
+    const uy = Math.sign(to.y - route.my) || 1;
+    return { x: to.x, y: to.y - uy * offset, angle: uy > 0 ? -Math.PI / 2 : Math.PI / 2 };
+  }
+  const { mx } = route;
   if (end === 'from') {
     const ux = Math.sign(mx - from.x) || 1;
     return { x: from.x + ux * offset, y: from.y, angle: ux > 0 ? 0 : Math.PI };
   }
   const ux = Math.sign(to.x - mx) || 1;
   return { x: to.x - ux * offset, y: to.y, angle: ux > 0 ? Math.PI : 0 };
+}
+
+function _beginInteraction(movedEntityIds = [], movedQueryIds = []) {
+  _interactionDepth += 1;
+  for (const id of movedEntityIds) _interactionMovedEntities.add(id);
+  for (const id of movedQueryIds) _interactionMovedQueries.add(id);
+  _container?.querySelector('#atlas-canvas-world')?.classList.add('atlas-canvas-interacting');
+}
+
+function _endInteraction() {
+  if (_interactionDepth <= 0) return;
+  _interactionDepth -= 1;
+  if (_interactionDepth > 0) return;
+
+  const entityIds = new Set(_interactionMovedEntities);
+  const queryIds = new Set(_interactionMovedQueries);
+  _interactionMovedEntities.clear();
+  _interactionMovedQueries.clear();
+  _lastDropTargetId = undefined;
+  _lastDropCardEl = null;
+
+  _container?.querySelector('#atlas-canvas-world')?.classList.remove('atlas-canvas-interacting');
+
+  const svg = _container?.querySelector('#atlas-canvas-svg');
+  if (entityIds.size) _patchAffectedEdges(svg, entityIds);
+  if (entityIds.size || queryIds.size) _patchAffectedDepEdges(svg, entityIds, queryIds);
+
+  if (_labelEditor?.dataset.relId) {
+    _updateLabelEditorPosition(_labelEditor.dataset.relId);
+  }
+}
+
+function _updateFlowTrackPaths(group, r, geom) {
+  if (_selectedRelId === r.id) return;
+  const { d, from, to, p1, p2 } = geom;
+  const p0 = from;
+  const p3 = to;
+  const { from: fromC, to: toC } = parseCardinalities(r);
+  const { flowMode } = edgeVisuals(fromC, toC);
+
+  const setTrackD = (pathUid, pathD) => {
+    const track = group.querySelector(`path.atlas-edge-flow-track#atlas-flow-${pathUid}`);
+    if (track) track.setAttribute('d', pathD);
+  };
+
+  if (flowMode === 'many_many') {
+    const split = _splitCubicBezier(p0, p1, p2, p3, 0.5);
+    setTrackD(`${r.id}-out-to`, split.second);
+    setTrackD(`${r.id}-out-from`, split.first);
+  } else if (flowMode === 'one_one') {
+    const split = _splitCubicBezier(p0, p1, p2, p3, 0.5);
+    setTrackD(`${r.id}-in-from`, split.first);
+    setTrackD(`${r.id}-in-to`, split.second);
+  } else {
+    setTrackD(`${r.id}-fwd`, d);
+  }
+}
+
+function _updateDepFlowPaths(group, edgeId, geom) {
+  group.querySelectorAll('.atlas-edge-flow-track, .atlas-edge-flow-balls').forEach(el => el.remove());
+  const { d, color } = geom;
+  _appendFlowBalls(group, d, 'forward', color, _animDelay(edgeId), `${edgeId}-fwd`);
+}
+
+function _depNodeForDep(dep) {
+  if (dep.source_type === 'entity') {
+    return _nodes.find(n => n.entity_id === dep.source_id);
+  }
+  return _queryNodes.find(n => n.query_id === dep.source_id);
+}
+
+function _patchAffectedDepEdges(svg, entityIds, queryIds) {
+  if (!svg) return;
+  const entSet = entityIds instanceof Set ? entityIds : new Set(entityIds || []);
+  const qSet = queryIds instanceof Set ? queryIds : new Set(queryIds || []);
+  if (!entSet.size && !qSet.size) return;
+
+  const seen = new Set();
+  _queryNodes.forEach(qn => {
+    const qMoved = qSet.has(qn.query_id);
+    (qn.dependencies || []).forEach(dep => {
+      const edgeId = `${dep.source_type}:${dep.source_id}->${qn.query_id}`;
+      if (seen.has(edgeId)) return;
+      const srcMoved = dep.source_type === 'entity'
+        ? entSet.has(dep.source_id)
+        : qSet.has(dep.source_id);
+      if (!qMoved && !srcMoved) return;
+      seen.add(edgeId);
+
+      const srcNode = _depNodeForDep(dep);
+      if (!srcNode) return;
+
+      const group = svg.querySelector(`g.atlas-edge-group[data-edge-id="${edgeId}"]`);
+      if (!group) return;
+
+      const geom = _depEdgeGeometry(srcNode, qn);
+      const { d, color, from, to } = geom;
+      group.querySelector('path.atlas-edge-hit')?.setAttribute('d', d);
+      const vis = group.querySelector('path.atlas-edge-vis');
+      if (vis) {
+        vis.setAttribute('d', d);
+        vis.setAttribute('stroke', color);
+      }
+      _updateDepFlowPaths(group, edgeId, geom);
+      for (const end of ['from', 'to']) {
+        const port = end === 'from' ? from : to;
+        const endpoint = group.querySelector(`circle.atlas-edge-endpoint[data-end="${end}"]`);
+        if (endpoint) {
+          endpoint.setAttribute('cx', port.x);
+          endpoint.setAttribute('cy', port.y);
+        }
+      }
+    });
+  });
+}
+
+function _patchAffectedEdges(svg, entityIds) {
+  if (!svg || !entityIds.size) return;
+  _ensureEdgeInteractions(svg);
+
+  for (const r of _relationships) {
+    if (!entityIds.has(r.from_entity_id) && !entityIds.has(r.to_entity_id)) continue;
+
+    const group = svg.querySelector(`g.atlas-edge-group[data-rel-id="${r.id}"]`);
+    if (!group) continue;
+
+    const geom = _edgeGeometry(r);
+    const { d, color, mid, from, to } = geom;
+
+    group.querySelector('path.atlas-edge-hit')?.setAttribute('d', d);
+    group.querySelector('path.atlas-edge-vis')?.setAttribute('d', d);
+    _updateFlowTrackPaths(group, r, geom);
+
+    const cards = parseCardinalities(r);
+    for (const end of ['from', 'to']) {
+      const placement = _markerPlacement(from, to, geom, end, end === 'from' ? r.from_anchor : r.to_anchor);
+      const card = end === 'from' ? cards.from : cards.to;
+      const markerG = group.querySelector(`g.atlas-edge-marker[data-end="${end}"]`);
+      if (markerG) {
+        updateCardinalityMarkerPlacement(markerG, card, placement.x, placement.y, placement.angle, color);
+      }
+      const port = end === 'from' ? from : to;
+      const endpoint = group.querySelector(`circle.atlas-edge-endpoint[data-end="${end}"]`);
+      if (endpoint) {
+        endpoint.setAttribute('cx', port.x);
+        endpoint.setAttribute('cy', port.y);
+      }
+    }
+
+    const labelEl = group.querySelector('text.atlas-edge-label');
+    if (labelEl && r.label) {
+      labelEl.setAttribute('x', mid.x);
+      labelEl.setAttribute('y', mid.y - 10);
+    }
+  }
 }
 
 function _relById(relId) {
@@ -400,7 +616,7 @@ async function _deleteRelationship(rel) {
 
 async function _editRelationship(rel) {
   if (!_worldId) return;
-  const data = await promptEditRelationship(rel, _entities);
+  const data = await promptEditRelationship(rel, _entities, _worldId);
   if (!data) return;
   if (data._delete) {
     await _deleteRelationship(rel);
@@ -425,7 +641,16 @@ function _scheduleEdgeRender(animate = false) {
   _edgeRaf = requestAnimationFrame(() => {
     _edgeRaf = 0;
     const svg = _container?.querySelector('#atlas-canvas-svg');
-    _renderEdges(svg, { animate });
+    if (_interactionDepth > 0) {
+      if (_interactionMovedEntities.size) {
+        _patchAffectedEdges(svg, _interactionMovedEntities);
+      }
+      if (_interactionMovedEntities.size || _interactionMovedQueries.size) {
+        _patchAffectedDepEdges(svg, _interactionMovedEntities, _interactionMovedQueries);
+      }
+    } else {
+      _renderEdges(svg, { animate });
+    }
     if (_labelEditor?.dataset.relId) {
       _updateLabelEditorPosition(_labelEditor.dataset.relId);
     }
@@ -497,14 +722,16 @@ function _renderEdges(svg, { animate = true } = {}) {
   const seen = new Set();
 
   _relationships.forEach(r => {
-    const { d, color, mid, from, to, mx } = _edgeGeometry(r);
+    const geom = _edgeGeometry(r);
+    const { d, color, mid, from, to } = geom;
     seen.add(r.id);
 
     let group = svg.querySelector(`g.atlas-edge-group[data-rel-id="${r.id}"]`);
     if (!group) {
       group = document.createElementNS(SVG_NS, 'g');
-      group.classList.add('atlas-edge-group');
+      group.classList.add('atlas-edge-group', 'atlas-plane-collection');
       group.dataset.relId = r.id;
+      group.dataset.edgeKind = 'rel';
       svg.appendChild(group);
     }
     group.classList.toggle('atlas-edge-selected', _selectedRelId === r.id);
@@ -548,11 +775,11 @@ function _renderEdges(svg, { animate = true } = {}) {
     vis.style.animationDelay = _animDelay(r.id);
     if (_selectedRelId === r.id) vis.classList.add('atlas-edge-selected');
 
-    _updateFlowPaths(group, r, { d, color, mid, from, to, mx });
+    _updateFlowPaths(group, r, geom);
 
     const cards = parseCardinalities(r);
     for (const end of ['from', 'to']) {
-      const placement = _markerPlacement(from, to, mx, end);
+      const placement = _markerPlacement(from, to, geom, end, end === 'from' ? r.from_anchor : r.to_anchor);
       const card = end === 'from' ? cards.from : cards.to;
       let markerG = group.querySelector(`g.atlas-edge-marker[data-end="${end}"]`);
       if (!markerG) {
@@ -578,7 +805,11 @@ function _renderEdges(svg, { animate = true } = {}) {
     }
 
     let labelEl = group.querySelector('text.atlas-edge-label');
-    if (r.label && _labelEditor?.dataset.relId !== r.id) {
+    const keyLabel = r.from_key?.name && r.to_key?.name
+      ? `${r.from_key.name} → ${r.to_key.name}`
+      : (r.from_field && r.to_field ? `${r.from_field} → ${r.to_field}` : '');
+    const edgeText = r.label || keyLabel;
+    if (edgeText && _labelEditor?.dataset.relId !== r.id) {
       if (!labelEl) {
         labelEl = document.createElementNS(SVG_NS, 'text');
         labelEl.classList.add('atlas-edge-label');
@@ -591,11 +822,13 @@ function _renderEdges(svg, { animate = true } = {}) {
       labelEl.setAttribute('x', mid.x);
       labelEl.setAttribute('y', mid.y - 10);
       labelEl.setAttribute('fill', 'var(--fg)');
-      labelEl.textContent = r.label;
+      labelEl.textContent = edgeText;
     } else if (labelEl) {
       labelEl.remove();
     }
   });
+
+  _renderDepEdges(svg, { animate });
 
   svg.querySelectorAll('g.atlas-edge-group[data-rel-id]').forEach(el => {
     if (!seen.has(el.dataset.relId)) el.remove();
@@ -606,6 +839,92 @@ function _portMarkup() {
   return PORT_ANCHORS.map(a =>
     `<div class="atlas-card-port atlas-card-port-${a}" data-side="${a}" data-anchor="${a}"></div>`
   ).join('');
+}
+
+function _resizeMarkup(prefix) {
+  return RESIZE_DIRS.map(dir =>
+    `<div class="${prefix}-resize ${prefix}-resize-${dir}" data-resize="${dir}"></div>`
+  ).join('');
+}
+
+function _computeResize(mode, dx, dy, ox, oy, ow, oh, minW, minH) {
+  let x = ox;
+  let y = oy;
+  let w = ow;
+  let h = oh;
+  if (mode.includes('e')) w = Math.max(minW, ow + dx);
+  if (mode.includes('w')) {
+    w = Math.max(minW, ow - dx);
+    x = ox + (ow - w);
+  }
+  if (mode.includes('s')) h = Math.max(minH, oh + dy);
+  if (mode.includes('n')) {
+    h = Math.max(minH, oh - dy);
+    y = oy + (oh - h);
+  }
+  return { x, y, w, h };
+}
+
+function _wireBoxResize(el, box, mins, { onMove, onStart, onEnd } = {}) {
+  el.querySelectorAll('[class*="-resize"]').forEach(handle => {
+    handle.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const mode = handle.dataset.resize || 'se';
+      const sx = e.clientX;
+      const sy = e.clientY;
+      const ox = box.x;
+      const oy = box.y;
+      const ow = box.w;
+      const oh = box.h;
+      onStart?.();
+      const onPointerMove = (ev) => {
+        const dx = (ev.clientX - sx) / _zoom;
+        const dy = (ev.clientY - sy) / _zoom;
+        const next = _computeResize(mode, dx, dy, ox, oy, ow, oh, mins.minW, mins.minH);
+        box.x = next.x;
+        box.y = next.y;
+        box.w = next.w;
+        box.h = next.h;
+        el.style.left = `${box.x}px`;
+        el.style.top = `${box.y}px`;
+        el.style.width = `${box.w}px`;
+        el.style.height = `${box.h}px`;
+        onMove?.();
+      };
+      const onPointerUp = () => {
+        document.removeEventListener('pointermove', onPointerMove);
+        document.removeEventListener('pointerup', onPointerUp);
+        document.removeEventListener('pointercancel', onPointerUp);
+        onEnd?.();
+      };
+      document.addEventListener('pointermove', onPointerMove);
+      document.addEventListener('pointerup', onPointerUp);
+      document.addEventListener('pointercancel', onPointerUp);
+    });
+  });
+}
+
+async function _deleteEntity(node) {
+  if (!_worldId) return;
+  const name = node.name || 'this collection';
+  const ok = await uiModule.styledConfirm(
+    `Delete collection "${name}"? All documents and relationships will be removed.`,
+    { confirmText: 'Delete', danger: true },
+  );
+  if (!ok) return;
+  try {
+    await _fetch(`/api/atlas/worlds/${_worldId}/entities/${node.entity_id}`, { method: 'DELETE' });
+    _nodes = _nodes.filter(n => n.entity_id !== node.entity_id);
+    _entities = _entities.filter(e => e.id !== node.entity_id);
+    _relationships = _relationships.filter(
+      r => r.from_entity_id !== node.entity_id && r.to_entity_id !== node.entity_id,
+    );
+    _renderCanvas(_container?.querySelector('#atlas-canvas-world'));
+    toastCollectionDeleted();
+  } catch (err) {
+    uiModule.showError(err.message);
+  }
 }
 
 async function _ensureWorld() {
@@ -716,11 +1035,16 @@ function _clearDropHighlights() {
   _container?.querySelectorAll('.atlas-card-drop-target').forEach(el => {
     el.classList.remove('atlas-card-drop-target');
   });
+  _lastDropTargetId = undefined;
+  _lastDropCardEl = null;
 }
 
 function _applyDropHighlights(cx, cy, { excludeClusterId = null, cardEl = null } = {}) {
-  _clearDropHighlights();
   const targetId = _hitTestCluster(cx, cy, excludeClusterId);
+  if (targetId === _lastDropTargetId && cardEl === _lastDropCardEl) return;
+  _clearDropHighlights();
+  _lastDropTargetId = targetId;
+  _lastDropCardEl = cardEl;
   if (targetId) {
     _container?.querySelector(
       `.atlas-canvas-cluster[data-cluster-id="${targetId}"]`,
@@ -782,9 +1106,7 @@ function _renderClusters(worldEl) {
       </div>
       <div class="atlas-cluster-body"></div>
       <div class="atlas-cluster-footer">${stats.collections} collection${stats.collections === 1 ? '' : 's'} · ${stats.docs} doc${stats.docs === 1 ? '' : 's'}</div>
-      <div class="atlas-cluster-resize atlas-cluster-resize-e" data-resize="e"></div>
-      <div class="atlas-cluster-resize atlas-cluster-resize-s" data-resize="s"></div>
-      <div class="atlas-cluster-resize atlas-cluster-resize-se" data-resize="se"></div>`;
+      ${_resizeMarkup('atlas-cluster')}`;
     el.style.setProperty('--cluster-i', String(idx));
     _wireClusterDrag(el, c);
     _wireClusterResize(el, c);
@@ -849,6 +1171,7 @@ async function _editCluster(cluster) {
 function _wireClusterDrag(el, cluster) {
   let dragging = false;
   let moved = false;
+  let interactionActive = false;
   let sx = 0; let sy = 0;
   const startPositions = new Map();
   const header = el.querySelector('.atlas-cluster-header');
@@ -861,15 +1184,20 @@ function _wireClusterDrag(el, cluster) {
       _selectedClusterId = cluster.id;
       dragging = true;
       moved = false;
+      interactionActive = false;
       sx = e.clientX; sy = e.clientY;
       startPositions.clear();
       const descIds = [cluster.id, ..._descendantClusterIds(cluster.id)];
       descIds.forEach(id => {
         const c = _clusterById(id);
-        if (c) startPositions.set(`c:${id}`, { x: c.x, y: c.y });
+        if (c) {
+          const cel = _container?.querySelector(`.atlas-canvas-cluster[data-cluster-id="${c.id}"]`);
+          startPositions.set(`c:${id}`, { x: c.x, y: c.y, el: cel });
+        }
       });
       _nodes.filter(n => n.cluster_id && descIds.includes(n.cluster_id)).forEach(n => {
-        startPositions.set(`n:${n.entity_id}`, { x: n.x, y: n.y });
+        const card = _container?.querySelector(`.atlas-canvas-card[data-entity-id="${n.entity_id}"]`);
+        startPositions.set(`n:${n.entity_id}`, { x: n.x, y: n.y, el: card });
       });
       el.setPointerCapture(e.pointerId);
       e.stopPropagation();
@@ -882,6 +1210,12 @@ function _wireClusterDrag(el, cluster) {
     if (!moved && Math.hypot(e.clientX - sx, e.clientY - sy) > MOVE_THRESHOLD) {
       moved = true;
       el.classList.add('atlas-cluster-dragging');
+      const entityIds = [];
+      startPositions.forEach((_, key) => {
+        if (key.startsWith('n:')) entityIds.push(key.slice(2));
+      });
+      _beginInteraction(entityIds);
+      interactionActive = true;
     }
     if (!moved) return;
     startPositions.forEach((pos, key) => {
@@ -890,10 +1224,9 @@ function _wireClusterDrag(el, cluster) {
         if (c) {
           c.x = pos.x + dx;
           c.y = pos.y + dy;
-          const cel = _container?.querySelector(`.atlas-canvas-cluster[data-cluster-id="${c.id}"]`);
-          if (cel) {
-            cel.style.left = `${c.x}px`;
-            cel.style.top = `${c.y}px`;
+          if (pos.el) {
+            pos.el.style.left = `${c.x}px`;
+            pos.el.style.top = `${c.y}px`;
           }
         }
       } else if (key.startsWith('n:')) {
@@ -901,10 +1234,9 @@ function _wireClusterDrag(el, cluster) {
         if (n) {
           n.x = pos.x + dx;
           n.y = pos.y + dy;
-          const card = _container?.querySelector(`.atlas-canvas-card[data-entity-id="${n.entity_id}"]`);
-          if (card) {
-            card.style.left = `${n.x}px`;
-            card.style.top = `${n.y}px`;
+          if (pos.el) {
+            pos.el.style.left = `${n.x}px`;
+            pos.el.style.top = `${n.y}px`;
           }
         }
       }
@@ -919,6 +1251,10 @@ function _wireClusterDrag(el, cluster) {
     dragging = false;
     el.classList.remove('atlas-cluster-dragging');
     _clearDropHighlights();
+    if (interactionActive) {
+      _endInteraction();
+      interactionActive = false;
+    }
     if (moved) {
       e.preventDefault();
       const cx = cluster.x + cluster.w / 2;
@@ -938,37 +1274,16 @@ function _wireClusterDrag(el, cluster) {
     moved = false;
     el.classList.remove('atlas-cluster-dragging');
     _clearDropHighlights();
+    if (interactionActive) {
+      _endInteraction();
+      interactionActive = false;
+    }
   });
 }
 
 function _wireClusterResize(el, cluster) {
-  el.querySelectorAll('.atlas-cluster-resize').forEach(handle => {
-    handle.addEventListener('pointerdown', (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      const mode = handle.dataset.resize || 'se';
-      const sx = e.clientX;
-      const sy = e.clientY;
-      const ow = cluster.w;
-      const oh = cluster.h;
-      const onMove = (ev) => {
-        const dx = (ev.clientX - sx) / _zoom;
-        const dy = (ev.clientY - sy) / _zoom;
-        if (mode.includes('e')) cluster.w = Math.max(MIN_CLUSTER_W, ow + dx);
-        if (mode.includes('s')) cluster.h = Math.max(MIN_CLUSTER_H, oh + dy);
-        el.style.width = `${cluster.w}px`;
-        el.style.height = `${cluster.h}px`;
-      };
-      const onUp = () => {
-        document.removeEventListener('pointermove', onMove);
-        document.removeEventListener('pointerup', onUp);
-        document.removeEventListener('pointercancel', onUp);
-        _scheduleSave();
-      };
-      document.addEventListener('pointermove', onMove);
-      document.addEventListener('pointerup', onUp);
-      document.addEventListener('pointercancel', onUp);
-    });
+  _wireBoxResize(el, cluster, { minW: MIN_CLUSTER_W, minH: MIN_CLUSTER_H }, {
+    onEnd: () => _scheduleSave(),
   });
 }
 
@@ -999,9 +1314,37 @@ async function _createClusterAt(x, y) {
   }
 }
 
+function _applyPlaneClasses() {
+  const surface = _container?.querySelector('#atlas-canvas-surface');
+  if (!surface) return;
+  surface.classList.toggle('atlas-plane-coll-dim', _planeFocus.queries && !_planeFocus.collections);
+  surface.classList.toggle('atlas-plane-query-dim', _planeFocus.collections && !_planeFocus.queries);
+  const fx = surface.querySelector('#atlas-fx-foreground');
+  if (fx) {
+    const dim = (!_planeFocus.collections && _planeFocus.queries) || (!_planeFocus.queries && _planeFocus.collections);
+    fx.hidden = !dim;
+  }
+}
+
+function _loadPlaneFocus() {
+  if (!_worldId) return;
+  try {
+    const raw = sessionStorage.getItem(`atlas-plane-focus:${_worldId}`);
+    if (raw) _planeFocus = { ..._planeFocus, ...JSON.parse(raw) };
+  } catch { /* ignore */ }
+}
+
+function _savePlaneFocus() {
+  if (!_worldId) return;
+  sessionStorage.setItem(`atlas-plane-focus:${_worldId}`, JSON.stringify(_planeFocus));
+}
+
 function _renderCanvas(worldEl) {
   _renderClusters(worldEl);
   _renderCards(worldEl);
+  _renderQueryCards(worldEl);
+  _renderEdges(_container?.querySelector('#atlas-canvas-svg'));
+  _applyPlaneClasses();
 }
 
 function _renderEmptyState() {
@@ -1025,12 +1368,193 @@ function _renderEmptyState() {
   surface.appendChild(el);
 }
 
+function _cardCenter(node) {
+  const w = node.w || DEFAULT_CARD_W;
+  const h = node.h || DEFAULT_CARD_H;
+  return { cx: node.x + w / 2, cy: node.y + h / 2, w, h };
+}
+
+function _nearestAnchor(from, to) {
+  const sides = [
+    { x: from.cx + from.w / 2, y: from.cy },
+    { x: from.cx - from.w / 2, y: from.cy },
+    { x: from.cx, y: from.cy + from.h / 2 },
+    { x: from.cx, y: from.cy - from.h / 2 },
+  ];
+  let best = sides[0];
+  let bestD = Infinity;
+  for (const s of sides) {
+    const d = Math.hypot(s.x - to.cx, s.y - to.cy);
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  return best;
+}
+
+function _sideToAnchor(sidePt, box) {
+  const { cx, cy, w, h } = box;
+  if (Math.abs(sidePt.x - (cx + w / 2)) < 1) return 'e';
+  if (Math.abs(sidePt.x - (cx - w / 2)) < 1) return 'w';
+  if (Math.abs(sidePt.y - (cy + h / 2)) < 1) return 's';
+  return 'n';
+}
+
+function _resolvedAccentColor() {
+  const root = getComputedStyle(document.documentElement);
+  return root.getPropertyValue('--accent').trim()
+    || root.getPropertyValue('--color-accent').trim()
+    || '#00aaff';
+}
+
+function _depEdgeGeometry(srcNode, tgtNode) {
+  const srcC = _cardCenter(srcNode);
+  const tgtC = _cardCenter(tgtNode);
+  const fromSide = _nearestAnchor(srcC, tgtC);
+  const toSide = _nearestAnchor(tgtC, srcC);
+  const fromAnchor = _sideToAnchor(fromSide, srcC);
+  const toAnchor = _sideToAnchor(toSide, tgtC);
+  const from = _nodePortPosition(srcNode, fromAnchor);
+  const to = _nodePortPosition(tgtNode, toAnchor);
+  const route = _computeEdgeRoute(from, to, fromAnchor, toAnchor);
+  const color = _resolvedAccentColor();
+  return { ...route, color, from, to, fromAnchor, toAnchor };
+}
+
+function _renderDepEdges(svg, { animate = true } = {}) {
+  if (!svg) return;
+  const seen = new Set();
+  _queryNodes.forEach(qn => {
+    (qn.dependencies || []).forEach(dep => {
+      const edgeId = `${dep.source_type}:${dep.source_id}->${qn.query_id}`;
+      if (seen.has(edgeId)) return;
+      seen.add(edgeId);
+
+      const srcNode = _depNodeForDep(dep);
+      if (!srcNode) return;
+
+      const geom = _depEdgeGeometry(srcNode, qn);
+      const { d, color, from, to } = geom;
+
+      let group = svg.querySelector(`g.atlas-edge-group[data-edge-id="${edgeId}"]`);
+      const isNew = !group;
+      if (!group) {
+        group = document.createElementNS(SVG_NS, 'g');
+        group.classList.add('atlas-edge-group', 'atlas-plane-bridge');
+        group.dataset.edgeId = edgeId;
+        group.dataset.edgeKind = 'dep';
+        svg.appendChild(group);
+      }
+
+      let hit = group.querySelector('path.atlas-edge-hit');
+      if (!hit) {
+        hit = document.createElementNS(SVG_NS, 'path');
+        hit.classList.add('atlas-edge-hit');
+        hit.setAttribute('stroke', 'transparent');
+        hit.setAttribute('stroke-width', '14');
+        hit.setAttribute('fill', 'none');
+        hit.style.pointerEvents = 'none';
+        group.appendChild(hit);
+      }
+      hit.setAttribute('d', d);
+
+      let vis = group.querySelector('path.atlas-edge-vis');
+      if (!vis) {
+        vis = document.createElementNS(SVG_NS, 'path');
+        vis.classList.add('atlas-edge', 'atlas-edge-vis');
+        vis.setAttribute('fill', 'none');
+        vis.setAttribute('stroke-width', '2');
+        vis.setAttribute('opacity', '0.55');
+        vis.setAttribute('pointer-events', 'none');
+        group.appendChild(vis);
+      }
+      vis.setAttribute('d', d);
+      vis.setAttribute('stroke', color);
+      vis.classList.remove('atlas-edge-draw', 'atlas-edge-live', 'atlas-edge-selected');
+      if (animate && isNew) {
+        vis.classList.add('atlas-edge-draw');
+        vis.addEventListener('animationend', () => {
+          vis.classList.remove('atlas-edge-draw');
+          vis.classList.add('atlas-edge-live');
+        }, { once: true });
+      } else {
+        vis.classList.add('atlas-edge-live');
+      }
+      vis.style.animationDelay = _animDelay(edgeId);
+
+      _updateDepFlowPaths(group, edgeId, geom);
+
+      for (const end of ['from', 'to']) {
+        const port = end === 'from' ? from : to;
+        let endpoint = group.querySelector(`circle.atlas-edge-endpoint[data-end="${end}"]`);
+        if (!endpoint) {
+          endpoint = document.createElementNS(SVG_NS, 'circle');
+          endpoint.classList.add('atlas-edge-endpoint');
+          endpoint.dataset.end = end;
+          endpoint.setAttribute('r', '10');
+          endpoint.style.pointerEvents = 'none';
+          group.appendChild(endpoint);
+        }
+        endpoint.setAttribute('cx', port.x);
+        endpoint.setAttribute('cy', port.y);
+      }
+    });
+  });
+  svg.querySelectorAll('g.atlas-edge-group[data-edge-kind="dep"]').forEach(el => {
+    if (!seen.has(el.dataset.edgeId)) el.remove();
+  });
+  svg.querySelectorAll('g.atlas-dep-edge').forEach(el => el.remove());
+}
+
+function _renderQueryCards(worldEl) {
+  if (!worldEl) return;
+  worldEl.querySelectorAll('.atlas-canvas-query-card').forEach(el => el.remove());
+  _queryNodes.forEach((n, idx) => {
+    const card = document.createElement('div');
+    card.className = 'atlas-canvas-card atlas-canvas-query-card atlas-chrome atlas-card-alive atlas-plane-query';
+    card.style.setProperty('--card-i', String(idx));
+    card.dataset.queryId = n.query_id;
+    card.style.left = `${n.x}px`;
+    card.style.top = `${n.y}px`;
+    card.style.width = `${n.w || DEFAULT_CARD_W}px`;
+    card.style.height = `${n.h || DEFAULT_CARD_H}px`;
+    if (n.z_index) card.style.zIndex = String(30 + n.z_index);
+    card.innerHTML = `
+      ${_portMarkup()}
+      <div class="atlas-card-header">
+        <span class="atlas-query-badge">QUERY</span>
+        <div class="atlas-card-title">${_esc(n.name)}</div>
+      </div>
+      <div class="atlas-card-footer">
+        <div class="atlas-card-meta">${n.row_count || 0} rows</div>
+        <div class="atlas-card-actions">
+          <button type="button" class="atlas-card-edit" title="Edit query" aria-label="Edit query">✎</button>
+          <button type="button" class="atlas-card-delete" title="Delete query" aria-label="Delete query">✕</button>
+        </div>
+      </div>
+      ${_resizeMarkup('atlas-card')}`;
+    _wireQueryCardDrag(card, n);
+    _wireQueryCardResize(card, n);
+    card.querySelector('.atlas-card-edit')?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await _editQuery(n);
+    });
+    card.querySelector('.atlas-card-delete')?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await _deleteQuery(n);
+    });
+    card.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.atlas-card-edit, .atlas-card-delete, .atlas-card-resize')) return;
+      if (_onOpenQuery) _onOpenQuery(n.query_id, n.name);
+    });
+    worldEl.appendChild(card);
+  });
+}
+
 function _renderCards(worldEl) {
   if (!worldEl) return;
-  worldEl.querySelectorAll('.atlas-canvas-card').forEach(el => el.remove());
+  worldEl.querySelectorAll('.atlas-canvas-card:not(.atlas-canvas-query-card)').forEach(el => el.remove());
   _nodes.forEach((n, idx) => {
     const card = document.createElement('div');
-    card.className = 'atlas-canvas-card atlas-chrome atlas-card-alive';
+    card.className = 'atlas-canvas-card atlas-chrome atlas-card-alive atlas-plane-collection';
     card.style.setProperty('--card-i', String(idx));
     card.style.setProperty('--card-enter-delay', `${Math.min(idx * 40, 400)}ms`);
     card.dataset.entityId = n.entity_id;
@@ -1043,12 +1567,15 @@ function _renderCards(worldEl) {
       ${_portMarkup()}
       <div class="atlas-card-header">
         <div class="atlas-card-title">${_esc(n.name)}</div>
-        <button type="button" class="atlas-card-edit" title="Edit collection" aria-label="Edit collection">✎</button>
       </div>
-      <div class="atlas-card-meta">${n.row_count || 0} docs</div>
-      <div class="atlas-card-resize atlas-card-resize-e" data-resize="e"></div>
-      <div class="atlas-card-resize atlas-card-resize-s" data-resize="s"></div>
-      <div class="atlas-card-resize atlas-card-resize-se" data-resize="se"></div>`;
+      <div class="atlas-card-footer">
+        <div class="atlas-card-meta">${n.row_count || 0} docs</div>
+        <div class="atlas-card-actions">
+          <button type="button" class="atlas-card-edit" title="Edit collection" aria-label="Edit collection">✎</button>
+          <button type="button" class="atlas-card-delete" title="Delete collection" aria-label="Delete collection">✕</button>
+        </div>
+      </div>
+      ${_resizeMarkup('atlas-card')}`;
     _wireCardDrag(card, n);
     _wireCardResize(card, n);
     _wirePortDrag(card, n);
@@ -1071,22 +1598,29 @@ function _renderCards(worldEl) {
         uiModule.showError(err.message);
       }
     });
+    card.querySelector('.atlas-card-delete')?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await _deleteEntity(n);
+    });
     worldEl.appendChild(card);
   });
-  _renderEdges(_container?.querySelector('#atlas-canvas-svg'));
 }
 
 function _wireCardDrag(card, node) {
   let dragging = false;
   let moved = false;
+  let interactionActive = false;
   let sx = 0; let sy = 0; let ox = 0; let oy = 0;
   card.addEventListener('pointerdown', (e) => {
     if (e.target.classList.contains('atlas-card-port')
       || e.target.closest('.atlas-card-edit')
+      || e.target.closest('.atlas-card-delete')
+      || e.target.closest('.atlas-card-actions')
       || e.target.closest('.atlas-card-resize')) return;
     _dismissLabelEditor();
     dragging = true;
     moved = false;
+    interactionActive = false;
     sx = e.clientX; sy = e.clientY;
     ox = node.x; oy = node.y;
     card.setPointerCapture(e.pointerId);
@@ -1099,6 +1633,8 @@ function _wireCardDrag(card, node) {
     if (!moved && Math.hypot(dx, dy) > MOVE_THRESHOLD) {
       moved = true;
       card.classList.add('atlas-card-dragging');
+      _beginInteraction([node.entity_id]);
+      interactionActive = true;
     }
     if (!moved) return;
     node.x = ox + dx / _zoom;
@@ -1119,6 +1655,10 @@ function _wireCardDrag(card, node) {
     dragging = false;
     card.classList.remove('atlas-card-dragging');
     _clearDropHighlights();
+    if (interactionActive) {
+      _endInteraction();
+      interactionActive = false;
+    }
     if (moved) {
       e.preventDefault();
       const cx = node.x + (node.w || 200) / 2;
@@ -1127,7 +1667,9 @@ function _wireCardDrag(card, node) {
       _scheduleSave();
       return;
     }
-    if (e.target.closest('.atlas-card-edit') || e.target.closest('.atlas-card-port') || e.target.closest('.atlas-card-resize')) return;
+    if (e.target.closest('.atlas-card-edit') || e.target.closest('.atlas-card-delete')
+      || e.target.closest('.atlas-card-actions') || e.target.closest('.atlas-card-port')
+      || e.target.closest('.atlas-card-resize')) return;
     card.classList.add('atlas-card-open-flash');
     setTimeout(() => {
       card.classList.remove('atlas-card-open-flash');
@@ -1142,41 +1684,35 @@ function _wireCardDrag(card, node) {
     moved = false;
     card.classList.remove('atlas-card-dragging');
     _clearDropHighlights();
+    if (interactionActive) {
+      _endInteraction();
+      interactionActive = false;
+    }
   });
 }
 
 function _wireCardResize(card, node) {
-  card.querySelectorAll('.atlas-card-resize').forEach(handle => {
-    handle.addEventListener('pointerdown', (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      const mode = handle.dataset.resize || 'se';
-      const sx = e.clientX;
-      const sy = e.clientY;
-      const ow = node.w || DEFAULT_CARD_W;
-      const oh = node.h || DEFAULT_CARD_H;
+  const box = {
+    get x() { return node.x; },
+    set x(v) { node.x = v; },
+    get y() { return node.y; },
+    set y(v) { node.y = v; },
+    get w() { return node.w || DEFAULT_CARD_W; },
+    set w(v) { node.w = v; },
+    get h() { return node.h || DEFAULT_CARD_H; },
+    set h(v) { node.h = v; },
+  };
+  _wireBoxResize(card, box, { minW: MIN_CARD_W, minH: MIN_CARD_H }, {
+    onStart: () => {
       card.classList.add('atlas-card-resizing');
-      const onMove = (ev) => {
-        const dx = (ev.clientX - sx) / _zoom;
-        const dy = (ev.clientY - sy) / _zoom;
-        if (mode.includes('e')) node.w = Math.max(MIN_CARD_W, ow + dx);
-        if (mode.includes('s')) node.h = Math.max(MIN_CARD_H, oh + dy);
-        card.style.width = `${node.w}px`;
-        card.style.height = `${node.h}px`;
-        _scheduleEdgeRender(false);
-      };
-      const onUp = () => {
-        document.removeEventListener('pointermove', onMove);
-        document.removeEventListener('pointerup', onUp);
-        document.removeEventListener('pointercancel', onUp);
-        card.classList.remove('atlas-card-resizing');
-        _scheduleSave();
-        _scheduleEdgeRender(false);
-      };
-      document.addEventListener('pointermove', onMove);
-      document.addEventListener('pointerup', onUp);
-      document.addEventListener('pointercancel', onUp);
-    });
+      _beginInteraction([node.entity_id]);
+    },
+    onMove: () => _scheduleEdgeRender(false),
+    onEnd: () => {
+      card.classList.remove('atlas-card-resizing');
+      _endInteraction();
+      _scheduleSave();
+    },
   });
 }
 
@@ -1235,14 +1771,25 @@ function _dragLineEndpoints(cursorX, cursorY) {
   return null;
 }
 
+function _dragLineAnchors() {
+  if (_portDrag) return { fromAnchor: _portDrag.fromAnchor, toAnchor: null };
+  if (_endpointDrag) {
+    const rel = _relById(_endpointDrag.relId);
+    if (!rel) return { fromAnchor: null, toAnchor: null };
+    if (_endpointDrag.end === 'from') return { fromAnchor: null, toAnchor: rel.to_anchor };
+    return { fromAnchor: rel.from_anchor, toAnchor: null };
+  }
+  return { fromAnchor: null, toAnchor: null };
+}
+
 function _updateDragLine(cursorX, cursorY, overValid = false) {
   const pts = _dragLineEndpoints(cursorX, cursorY);
   if (!pts) return;
   const svg = _getDragLineSvg();
   if (!svg) return;
   const { from, to } = pts;
-  const mx = (from.x + to.x) / 2;
-  const d = `M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}`;
+  const { fromAnchor, toAnchor } = _dragLineAnchors();
+  const { d } = _computeEdgeRoute(from, to, fromAnchor, toAnchor);
   const stroke = overValid ? '#86efac' : 'var(--accent)';
   svg.innerHTML = `<path d="${d}" stroke="${stroke}" fill="none" stroke-width="2.5" stroke-dasharray="8 5" opacity="0.95"/>`;
 }
@@ -1385,7 +1932,7 @@ async function _onPortPointerUp(e) {
   const data = await promptRelationship(_entities, drag.fromEntityId, drop.entityId, {
     from_anchor: drag.fromAnchor,
     to_anchor: drop.anchor,
-  });
+  }, _worldId);
   if (!data) return;
   try {
     await _fetch(`/api/atlas/worlds/${_worldId}/relationships`, {
@@ -1509,20 +2056,195 @@ function _wirePanZoom(surface, worldEl) {
   });
 }
 
+function _wireQueryCardDrag(card, node) {
+  let dragging = false;
+  let moved = false;
+  let interactionActive = false;
+  let sx = 0; let sy = 0; let ox = 0; let oy = 0;
+  card.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.atlas-card-edit, .atlas-card-delete, .atlas-card-actions, .atlas-card-resize')) return;
+    _dismissLabelEditor();
+    dragging = true;
+    moved = false;
+    interactionActive = false;
+    sx = e.clientX; sy = e.clientY; ox = node.x; oy = node.y;
+    card.setPointerCapture(e.pointerId);
+    e.stopPropagation();
+  });
+  card.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - sx;
+    const dy = e.clientY - sy;
+    if (!moved && Math.hypot(dx, dy) > MOVE_THRESHOLD) {
+      moved = true;
+      card.classList.add('atlas-card-dragging');
+      _beginInteraction([], [node.query_id]);
+      interactionActive = true;
+    }
+    if (!moved) return;
+    node.x = ox + dx / _zoom;
+    node.y = oy + dy / _zoom;
+    card.style.left = `${node.x}px`;
+    card.style.top = `${node.y}px`;
+    const cx = node.x + (node.w || DEFAULT_CARD_W) / 2;
+    const cy = node.y + (node.h || DEFAULT_CARD_H) / 2;
+    _applyDropHighlights(cx, cy, { cardEl: card });
+    _scheduleEdgeRender(false);
+  });
+  card.addEventListener('pointerup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    card.classList.remove('atlas-card-dragging');
+    _clearDropHighlights();
+    if (interactionActive) {
+      _endInteraction();
+      interactionActive = false;
+    }
+    if (moved) {
+      e.preventDefault();
+      const cx = node.x + (node.w || DEFAULT_CARD_W) / 2;
+      const cy = node.y + (node.h || DEFAULT_CARD_H) / 2;
+      node.cluster_id = _hitTestCluster(cx, cy);
+      _scheduleSave();
+      return;
+    }
+    if (e.target.closest('.atlas-card-edit, .atlas-card-delete, .atlas-card-resize')) return;
+    if (_onOpenQuery) _onOpenQuery(node.query_id, node.name);
+  });
+  card.addEventListener('pointercancel', () => {
+    dragging = false;
+    moved = false;
+    card.classList.remove('atlas-card-dragging');
+    _clearDropHighlights();
+    if (interactionActive) {
+      _endInteraction();
+      interactionActive = false;
+    }
+  });
+}
+
+function _wireQueryCardResize(card, node) {
+  const box = {
+    get x() { return node.x; }, set x(v) { node.x = v; },
+    get y() { return node.y; }, set y(v) { node.y = v; },
+    get w() { return node.w || DEFAULT_CARD_W; }, set w(v) { node.w = v; },
+    get h() { return node.h || DEFAULT_CARD_H; }, set h(v) { node.h = v; },
+  };
+  _wireBoxResize(card, box, { minW: MIN_CARD_W, minH: MIN_CARD_H }, {
+    onStart: () => {
+      card.classList.add('atlas-card-resizing');
+      _beginInteraction([], [node.query_id]);
+    },
+    onMove: () => _scheduleEdgeRender(false),
+    onEnd: () => {
+      card.classList.remove('atlas-card-resizing');
+      _endInteraction();
+      _scheduleSave();
+    },
+  });
+}
+
+async function _fetchQueryRowCount(queryId) {
+  if (!_worldId || !queryId) return 0;
+  try {
+    const result = await _fetch(`/api/atlas/worlds/${_worldId}/queries/${queryId}/find`, {
+      method: 'POST',
+      body: JSON.stringify({ filter: {}, limit: 1, offset: 0 }),
+    });
+    return result.total || 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function _createQuery() {
+  if (!_worldId) return;
+  const catalog = await _fetch(`/api/atlas/worlds/${_worldId}/schema-catalog`);
+  const data = await promptQuery({
+    worldId: _worldId,
+    catalog,
+    onValidate: (sql) => _fetch(`/api/atlas/worlds/${_worldId}/queries/validate`, {
+      method: 'POST',
+      body: JSON.stringify({ sql_text: sql, preview_limit: 25 }),
+    }),
+  });
+  if (!data) return;
+  const q = await _fetch(`/api/atlas/worlds/${_worldId}/queries`, {
+    method: 'POST', body: JSON.stringify(data),
+  });
+  const rowCount = await _fetchQueryRowCount(q.id);
+  const { x, y } = _viewportCenterWorld(DEFAULT_CARD_W, DEFAULT_CARD_H);
+  _queryNodes.push({
+    query_id: q.id,
+    name: q.name,
+    x,
+    y,
+    w: DEFAULT_CARD_W,
+    h: DEFAULT_CARD_H,
+    row_count: rowCount,
+    dependencies: q.dependencies || [],
+  });
+  _renderCanvas(_container?.querySelector('#atlas-canvas-world'));
+  _scheduleSave();
+}
+
+async function _editQuery(node) {
+  if (!_worldId) return;
+  const catalog = await _fetch(`/api/atlas/worlds/${_worldId}/schema-catalog`);
+  const q = await _fetch(`/api/atlas/worlds/${_worldId}/queries`).then(d =>
+    (d.queries || []).find(x => x.id === node.query_id));
+  const data = await promptQuery({
+    worldId: _worldId,
+    catalog,
+    query: q,
+    onValidate: (sql, qid) => _fetch(`/api/atlas/worlds/${_worldId}/queries/validate`, {
+      method: 'POST',
+      body: JSON.stringify({ sql_text: sql, query_id: qid || node.query_id, preview_limit: 25 }),
+    }),
+  });
+  if (!data) return;
+  const updated = await _fetch(`/api/atlas/worlds/${_worldId}/queries/${node.query_id}`, {
+    method: 'PUT', body: JSON.stringify(data),
+  });
+  node.name = updated.name;
+  node.dependencies = updated.dependencies || [];
+  node.row_count = await _fetchQueryRowCount(node.query_id);
+  _renderCanvas(_container?.querySelector('#atlas-canvas-world'));
+  _scheduleSave();
+}
+
+async function _deleteQuery(node) {
+  const ok = await uiModule.styledConfirm(`Delete query "${node.name}"?`, { confirmText: 'Delete', danger: true });
+  if (!ok) return;
+  await _fetch(`/api/atlas/worlds/${_worldId}/queries/${node.query_id}`, { method: 'DELETE' });
+  _queryNodes = _queryNodes.filter(n => n.query_id !== node.query_id);
+  _renderCanvas(_container?.querySelector('#atlas-canvas-world'));
+  _scheduleSave();
+}
+
 async function _refresh() {
   if (!_worldId) {
     _renderEmptyState();
     return;
   }
-  const [layout, rels, entData] = await Promise.all([
+  _loadPlaneFocus();
+  const [layout, rels, entData, queriesData] = await Promise.all([
     _fetch(`/api/atlas/worlds/${_worldId}/canvas`),
     _fetch(`/api/atlas/worlds/${_worldId}/relationships`),
     _fetch(`/api/atlas/worlds/${_worldId}/entities`),
+    _fetch(`/api/atlas/worlds/${_worldId}/queries`),
   ]);
+  const qById = Object.fromEntries((queriesData.queries || []).map(q => [q.id, q]));
   _nodes = (layout.nodes || []).map(n => ({
     ...n,
     w: n.w ?? DEFAULT_CARD_W,
     h: n.h ?? DEFAULT_CARD_H,
+  }));
+  _queryNodes = (layout.query_nodes || []).map(n => ({
+    ...n,
+    w: n.w ?? DEFAULT_CARD_W,
+    h: n.h ?? DEFAULT_CARD_H,
+    dependencies: qById[n.query_id]?.dependencies || n.dependencies || [],
   }));
   _clusters = layout.clusters || [];
   _relationships = rels.relationships || [];
@@ -1662,7 +2384,22 @@ function _wireToolbar() {
   });
 
   _container?.querySelector('#atlas-new-cluster-btn')?.addEventListener('click', async () => {
-    await _createClusterAt(80 + _clusters.length * 40, 80 + _clusters.length * 40);
+    const { x, y } = _viewportCenterWorld(DEFAULT_CLUSTER_W, DEFAULT_CLUSTER_H);
+    await _createClusterAt(x, y);
+  });
+
+  _container?.querySelector('#atlas-new-query-btn')?.addEventListener('click', async () => {
+    await _createQuery();
+  });
+
+  _container?.querySelectorAll('.atlas-plane-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const plane = btn.dataset.plane;
+      _planeFocus[plane] = !_planeFocus[plane];
+      btn.classList.toggle('active', _planeFocus[plane]);
+      _savePlaneFocus();
+      _applyPlaneClasses();
+    });
   });
 
   _container?.querySelector('#atlas-world-select')?.addEventListener('change', async (e) => {
@@ -1719,14 +2456,16 @@ function _wireToolbar() {
 }
 
 export async function mountCanvas(container, {
-  worldId, worlds, entities, onOpenEntity, onWorldChange,
+  worldId, worlds, entities, onOpenEntity, onOpenQuery, onWorldChange,
 }) {
   _container = container;
   _worldId = worldId;
   _worlds = worlds || [];
   _entities = entities || [];
   _onOpenEntity = onOpenEntity;
+  _onOpenQuery = onOpenQuery;
   _onWorldChange = onWorldChange;
+  _loadPlaneFocus();
   _panX = 40; _panY = 40; _zoom = 1;
 
   container.innerHTML = `
@@ -1742,14 +2481,21 @@ export async function mountCanvas(container, {
           <button type="button" class="admin-btn-sm" id="atlas-world-import-excel-btn">Import Excel…</button>
         </div>
         <button type="button" class="admin-btn-sm" id="atlas-worlds-btn">Worlds…</button>
+        <div class="atlas-plane-focus atlas-chrome">
+          <span class="atlas-plane-focus-label">Focus</span>
+          <button type="button" class="admin-btn-sm atlas-plane-toggle active" data-plane="collections">Collections</button>
+          <button type="button" class="admin-btn-sm atlas-plane-toggle active" data-plane="queries">Queries</button>
+        </div>
         <div class="atlas-header-actions">
           <button type="button" class="admin-btn-sm" id="atlas-new-world-btn">+ World</button>
           <button type="button" class="admin-btn-sm" id="atlas-new-cluster-btn">+ Cluster</button>
           <button type="button" class="admin-btn-sm" id="atlas-new-entity-btn">+ Collection</button>
+          <button type="button" class="admin-btn-sm" id="atlas-new-query-btn">+ Query</button>
           <button type="button" class="atlas-close-btn" id="atlas-close-btn" title="Close">✕</button>
         </div>
       </div>
       <div class="atlas-canvas-surface" id="atlas-canvas-surface">
+        <div id="atlas-fx-foreground" class="atlas-fx-foreground" hidden aria-hidden="true"></div>
         <div id="atlas-canvas-world" class="atlas-canvas-world">
           <div id="atlas-canvas-clusters" class="atlas-canvas-clusters-layer"></div>
           <svg id="atlas-canvas-svg" class="atlas-canvas-svg"></svg>
@@ -1760,6 +2506,10 @@ export async function mountCanvas(container, {
 
   _updateWorldSelect();
   _wireToolbar();
+  _container?.querySelectorAll('.atlas-plane-toggle').forEach(btn => {
+    const plane = btn.dataset.plane;
+    btn.classList.toggle('active', _planeFocus[plane]);
+  });
   const surface = container.querySelector('#atlas-canvas-surface');
   const worldEl = container.querySelector('#atlas-canvas-world');
   worldEl.style.transform = `translate(${_panX}px,${_panY}px) scale(${_zoom})`;
@@ -1775,6 +2525,11 @@ export function unmountCanvas() {
   if (_edgeRaf) cancelAnimationFrame(_edgeRaf);
   _edgeRaf = 0;
   _edgesWired = false;
+  _interactionDepth = 0;
+  _interactionMovedEntities.clear();
+  _interactionMovedQueries.clear();
+  _lastDropTargetId = undefined;
+  _lastDropCardEl = null;
   _dismissLabelEditor();
   _portDrag = null;
   _endpointDrag = null;
@@ -1796,4 +2551,21 @@ export async function reloadCanvasData(worldId, worlds, entities) {
   _entities = entities || _entities;
   _updateWorldSelect();
   await _refresh();
+}
+
+export function updateEntityCard(entityId, { name, rowCount } = {}) {
+  const node = _nodes.find(n => n.entity_id === entityId);
+  if (!node || !_container) return;
+  if (name != null) {
+    node.name = name;
+    const card = _container.querySelector(`.atlas-canvas-card[data-entity-id="${entityId}"]`);
+    const title = card?.querySelector('.atlas-card-title');
+    if (title) title.textContent = name;
+  }
+  if (rowCount != null) {
+    node.row_count = rowCount;
+    const card = _container.querySelector(`.atlas-canvas-card[data-entity-id="${entityId}"]`);
+    const meta = card?.querySelector('.atlas-card-meta');
+    if (meta) meta.textContent = `${rowCount} docs`;
+  }
 }

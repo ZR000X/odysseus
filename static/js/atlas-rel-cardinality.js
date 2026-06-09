@@ -62,26 +62,41 @@ export function cardinalityOptionsHtml(selected, side) {
   return `<select class="atlas-rel-cardinality-select atlas-form-input" id="${id}" aria-label="${side === 'from' ? 'From' : 'To'} cardinality">${opts}</select>`;
 }
 
-/** For flow/color only: zero-or-one behaves like one. */
+/** For flow/color only: zero-or-one behaves like one (except pure 1↔0..1 pairs). */
 function _visualCardinality(c) {
   return c === 'one_or_zero' ? 'one' : c;
 }
 
+function _isOneToOptional(fromC, toC) {
+  return (fromC === 'one' && toC === 'one_or_zero')
+    || (fromC === 'one_or_zero' && toC === 'one');
+}
+
 export function edgeVisuals(fromC, toC) {
-  const fromV = _visualCardinality(fromC);
-  const toV = _visualCardinality(toC);
+  const from = _normalizeCardinality(fromC) || 'one';
+  const to = _normalizeCardinality(toC) || 'many';
+  const fromV = _visualCardinality(from);
+  const toV = _visualCardinality(to);
   const root = getComputedStyle(document.documentElement);
   const fg = root.getPropertyValue('--fg').trim() || '#cbd5e1';
   const accent = root.getPropertyValue('--accent').trim()
     || root.getPropertyValue('--color-accent').trim()
     || '#00aaff';
-  if (fromV === 'one' && toV === 'one') {
+  if (from === 'one' && to === 'one') {
     return { color: accent, bidirectional: true, flowMode: 'one_one' };
+  }
+  if (from === 'one_or_zero' && to === 'one_or_zero') {
+    return { color: accent, bidirectional: true, flowMode: 'one_one' };
+  }
+  if (_isOneToOptional(from, to)) {
+    const flowDirection = from === 'one' && to === 'one_or_zero' ? 'forward' : 'reverse';
+    return { color: accent, bidirectional: false, flowMode: 'directed', flowDirection };
   }
   if (fromV === 'many' && toV === 'many') {
     return { color: '#f0abfc', bidirectional: true, flowMode: 'many_many' };
   }
-  return { color: fg, bidirectional: false, flowMode: 'directed' };
+  const flowDirection = fromV === 'many' && toV === 'one' ? 'reverse' : 'forward';
+  return { color: fg, bidirectional: false, flowMode: 'directed', flowDirection };
 }
 
 export function cardinalityMarkerHtml(cardinality, end) {
@@ -93,6 +108,60 @@ export function cardinalityMarkerHtml(cardinality, end) {
     return `<div class="atlas-rel-marker atlas-rel-marker-one_or_zero ${facing}" aria-hidden="true"><span class="atlas-rel-marker-bar"></span></div>`;
   }
   return `<div class="atlas-rel-marker atlas-rel-marker-many ${facing}" aria-hidden="true"><span class="atlas-rel-marker-stem"></span></div>`;
+}
+
+export function updateCardinalityMarkerPlacement(g, cardinality, x, y, angle, color) {
+  if (!g.childNodes.length) {
+    renderCardinalityMarker(g, cardinality, x, y, angle, color);
+    return;
+  }
+  const strokeW = 1.75;
+  if (cardinality === 'one') {
+    const perp = angle + Math.PI / 2;
+    const len = 5;
+    const line = g.querySelector('.atlas-edge-marker-line');
+    if (line) {
+      line.setAttribute('x1', x - Math.cos(perp) * len);
+      line.setAttribute('y1', y - Math.sin(perp) * len);
+      line.setAttribute('x2', x + Math.cos(perp) * len);
+      line.setAttribute('y2', y + Math.sin(perp) * len);
+      line.setAttribute('stroke', color);
+    }
+    return;
+  }
+  if (cardinality === 'one_or_zero') {
+    const perp = angle + Math.PI / 2;
+    const barLen = 5;
+    const line = g.querySelector('.atlas-edge-marker-line');
+    if (line) {
+      line.setAttribute('x1', x - Math.cos(perp) * barLen);
+      line.setAttribute('y1', y - Math.sin(perp) * barLen);
+      line.setAttribute('x2', x + Math.cos(perp) * barLen);
+      line.setAttribute('y2', y + Math.sin(perp) * barLen);
+      line.setAttribute('stroke', color);
+    }
+    const circleOffset = 7;
+    const circle = g.querySelector('.atlas-edge-marker-circle');
+    if (circle) {
+      circle.setAttribute('cx', x + Math.cos(angle) * circleOffset);
+      circle.setAttribute('cy', y + Math.sin(angle) * circleOffset);
+      circle.setAttribute('stroke', color);
+    }
+    return;
+  }
+  const len = 7;
+  const spread = 0.48;
+  const footAngle = angle + Math.PI;
+  const angles = [footAngle, footAngle - spread, footAngle + spread];
+  g.querySelectorAll('.atlas-edge-marker-line').forEach((line, i) => {
+    const a = angles[i];
+    if (a === undefined) return;
+    line.setAttribute('x1', x);
+    line.setAttribute('y1', y);
+    line.setAttribute('x2', x + Math.cos(a) * len);
+    line.setAttribute('y2', y + Math.sin(a) * len);
+    line.setAttribute('stroke', color);
+  });
 }
 
 export function renderCardinalityMarker(g, cardinality, x, y, angle, color) {
