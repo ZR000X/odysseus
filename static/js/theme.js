@@ -53,7 +53,7 @@ const THEME_DEFAULT_PATTERN = {
   cyberpunk:  'synapse',
   retrowave:  'embers',
   forest:     'petals',
-  ocean:      'constellations',
+  ocean:      'bubbles',
   terminal:   'perlin-flow',
   organs:     'rain',
   ume:        'petals',
@@ -66,6 +66,7 @@ const THEME_DEFAULT_EFFECT_COLOR = {
   organs:     '#451616',
   cute:       '#ff8cb8',
   ume:        '#f5a0c0',
+  ocean:      '#7dd3fc',
 };
 
 // Default effect intensity (0..1) per theme. Any theme not listed defaults to 1.
@@ -73,6 +74,7 @@ const THEME_DEFAULT_INTENSITY = {
   midnight:   0.5,
   terminal:   0.8,
   organs:     0.65,
+  ocean:      0.75,
 };
 
 // Default frosted-glass state per theme. Themes not listed default to false.
@@ -388,10 +390,10 @@ export function applyFontDensity(font, density) {
 const _BG_CLASSES = ['bg-pattern-dots',
   'bg-pattern-synapse', 'bg-pattern-rain', 'bg-pattern-constellations',
   'bg-pattern-perlin-flow',
-  'bg-pattern-petals', 'bg-pattern-sparkles', 'bg-pattern-embers'];
+  'bg-pattern-petals', 'bg-pattern-sparkles', 'bg-pattern-embers', 'bg-pattern-bubbles'];
 const _CANVAS_PATTERNS = { synapse: _initSynapse, rain: _initRain, constellations: _initConstellations,
   'perlin-flow': _initPerlinFlow,
-  petals: _initPetals, sparkles: _initSparkles, embers: _initEmbers };
+  petals: _initPetals, sparkles: _initSparkles, embers: _initEmbers, bubbles: _initBubbles };
 
 export function applyBgEffectColor(color) {
   document.documentElement.style.setProperty('--bg-effect-color', color || '');
@@ -429,7 +431,7 @@ export function applyBgPattern(pattern) {
   const p = pattern || 'none';
   document.body.classList.remove(..._BG_CLASSES);
   // Clean up any canvas backgrounds
-  document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas').forEach(c => c.remove());
+  document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas, #bubbles-canvas').forEach(c => c.remove());
   if (p !== 'none') document.body.classList.add('bg-pattern-' + p);
   if (_CANVAS_PATTERNS[p]) _CANVAS_PATTERNS[p]();
   // Hide sliders that do nothing on static patterns.
@@ -1934,6 +1936,105 @@ function _initSparkles() {
       // respawn when cycle completes
       if (s.phase > Math.PI * 6) Object.assign(s, makeSpark());
     });
+    ctx.globalAlpha = 1;
+  }
+  draw();
+}
+
+// ── Bubbles — translucent circles rising with a gentle wobble ──
+function _initBubbles() {
+  if (document.getElementById('bubbles-canvas')) return;
+  const canvas = document.createElement('canvas');
+  canvas.id = 'bubbles-canvas';
+  canvas.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
+  canvas.setAttribute('aria-hidden', 'true');
+  document.body.prepend(canvas);
+  const ctx = canvas.getContext('2d');
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let W, H;
+  const bubbles = [];
+  function makeBubble() {
+    const sizeMult = _getEffectSize();
+    const r = (3 + Math.random() * 10) * sizeMult;
+    return {
+      x: Math.random() * W,
+      y: H + r + Math.random() * 30,
+      r,
+      vy: -(0.25 + Math.random() * 0.55) * sizeMult,
+      wobble: Math.random() * Math.PI * 2,
+      wobbleSpeed: 0.012 + Math.random() * 0.018,
+      drift: 0.4 + Math.random() * 0.9,
+      alpha: 0.18 + Math.random() * 0.22,
+    };
+  }
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (bubbles.length === 0) {
+      for (let i = 0; i < 28; i++) {
+        const b = makeBubble();
+        b.y = Math.random() * H;
+        bubbles.push(b);
+      }
+    }
+  }
+  resize();
+  const _onResize = () => resize();
+  window.addEventListener('resize', _onResize);
+  function getColor() {
+    const s = getComputedStyle(document.documentElement);
+    return s.getPropertyValue('--bg-effect-color').trim() || s.getPropertyValue('--fg').trim() || '#64d2ff';
+  }
+  function rgba(hex, a) {
+    const { r, g, b } = hexToRgb(hex) || { r: 0, g: 0, b: 0 };
+    return `rgba(${r},${g},${b},${a})`;
+  }
+  function drawBubble(b, color) {
+    const intenCss = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--bg-effect-intensity'));
+    const inten = isNaN(intenCss) ? 1 : intenCss;
+    const alpha = b.alpha * inten;
+    ctx.strokeStyle = rgba(color, alpha * 0.55);
+    ctx.lineWidth = Math.max(0.6, b.r * 0.08);
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.stroke();
+    const g = ctx.createRadialGradient(b.x - b.r * 0.35, b.y - b.r * 0.35, 0, b.x, b.y, b.r);
+    g.addColorStop(0, rgba(color, alpha * 0.12));
+    g.addColorStop(0.65, rgba(color, alpha * 0.04));
+    g.addColorStop(1, rgba(color, alpha * 0.18));
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r * 0.92, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = rgba('#ffffff', alpha * 0.35);
+    ctx.beginPath();
+    ctx.arc(b.x - b.r * 0.32, b.y - b.r * 0.32, b.r * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  function draw() {
+    if (!document.body.classList.contains('bg-pattern-bubbles')) {
+      window.removeEventListener('resize', _onResize);
+      canvas.remove();
+      return;
+    }
+    requestAnimationFrame(draw);
+    ctx.clearRect(0, 0, W, H);
+    const color = getColor();
+    const intenCss = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--bg-effect-intensity'));
+    const inten = isNaN(intenCss) ? 1 : intenCss;
+    if (bubbles.length < 40 * inten && Math.random() < 0.04 * inten) bubbles.push(makeBubble());
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i];
+      b.wobble += b.wobbleSpeed;
+      b.x += Math.sin(b.wobble) * b.drift;
+      b.y += b.vy;
+      if (b.y < -b.r * 2) {
+        bubbles.splice(i, 1);
+        continue;
+      }
+      drawBubble(b, color);
+    }
     ctx.globalAlpha = 1;
   }
   draw();

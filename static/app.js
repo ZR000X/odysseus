@@ -24,6 +24,7 @@ import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
+import atlasModule from './js/atlas.js';
 import adminModule from './js/admin.js';
 import settingsModule from './js/settings.js';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
@@ -915,6 +916,14 @@ function initializeEventListeners() {
       }
     });
   }
+
+  const toolAtlasBtn = el('tool-atlas-btn');
+  if (toolAtlasBtn) {
+    toolAtlasBtn.addEventListener('click', () => {
+      if (atlasModule) atlasModule.togglePanel();
+    });
+  }
+
   // Refresh notes due-reminder badge on load and every 5 minutes
   if (notesModule && notesModule.refreshDueBadge) {
     notesModule.refreshDueBadge();
@@ -1044,6 +1053,7 @@ function initializeEventListeners() {
     '/gallery':  () => document.getElementById('tool-gallery-btn')?.click(),
     '/tasks':    () => document.getElementById('tool-tasks-btn')?.click(),
     '/library':  () => sessionModule && sessionModule.openLibrary && sessionModule.openLibrary(),
+    '/atlas':    () => atlasModule && atlasModule.openPanel(),
   };
   const _opener = _routeOpen[urlPath];
   // Defer the opener — at this point in init, the modules whose handlers
@@ -2409,6 +2419,7 @@ function initializeEventListeners() {
     'tool-library':        '#tool-library-btn',
     'tool-memory':         '#tool-memory-btn',
     'tool-notes':          '#tool-notes-btn',
+    'tool-atlas':          '#tool-atlas-btn',
     'tool-tasks':          '#tool-tasks-btn',
     'tool-theme':          '#tool-theme-btn',
     'user-bar':            '#user-bar-profile',

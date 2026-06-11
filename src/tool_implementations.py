@@ -1438,6 +1438,674 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Atlas tool — structured data worlds
+# ---------------------------------------------------------------------------
+
+_ATLAS_SYSTEM_DOC_KEYS = frozenset({"_id", "_atlas_row_id", "_atlas_created_at", "_atlas_updated_at"})
+
+
+def _atlas_format_world_line(w: Dict[str, Any]) -> str:
+    desc = f' — {w["description"]}' if (w.get("description") or "").strip() else ""
+    return (
+        f"- **{w['name']}**{desc} — world_id: `{w['id']}` "
+        f"(prefix `{w['id'][:8]}`, {w['entity_count']} entities, {w['row_count']} rows)"
+    )
+
+
+def _atlas_format_entity_line(e: Dict[str, Any], *, include_fields: bool = False) -> str:
+    line = (
+        f"- **{e['name']}** — entity_id: `{e['id']}` "
+        f"(prefix `{e['id'][:8]}`, {e['row_count']} docs)"
+    )
+    if include_fields:
+        fields = ", ".join(f["slug"] for f in e.get("fields", [])) or "(schemaless)"
+        line += f" — {fields}"
+    return line
+
+
+def _atlas_world_context(w: Dict[str, Any], *, used_default: bool = False) -> Dict[str, Any]:
+    return {
+        "world_id": w["id"],
+        "world_name": w["name"],
+        "_used_default_world": used_default,
+    }
+
+
+def _atlas_entity_context(e: Dict[str, Any]) -> Dict[str, Any]:
+    return {"entity_id": e["id"], "entity_name": e["name"]}
+
+
+def _atlas_project_doc(doc: Dict[str, Any], fields: Optional[List[str]]) -> Dict[str, Any]:
+    if not fields:
+        return doc
+    out: Dict[str, Any] = {"_id": doc.get("_id")}
+    for f in fields:
+        if f in doc:
+            out[f] = doc[f]
+    return out
+
+
+def _atlas_format_doc_compact(doc: Dict[str, Any]) -> str:
+    parts = [f"_id={doc.get('_id')}"]
+    for k, v in doc.items():
+        if k in _ATLAS_SYSTEM_DOC_KEYS:
+            continue
+        if isinstance(v, (dict, list)):
+            continue
+        if isinstance(v, str) and " " in v:
+            parts.append(f'{k}="{v}"')
+        else:
+            parts.append(f"{k}={v}")
+    return " ".join(parts)
+
+
+def _atlas_format_docs_table(docs: List[Dict[str, Any]], fields: Optional[List[str]]) -> str:
+    if not docs:
+        return ""
+    cols = list(fields) if fields else []
+    if not cols:
+        for d in docs:
+            for k in d:
+                if k not in _ATLAS_SYSTEM_DOC_KEYS and k not in cols:
+                    cols.append(k)
+        cols = cols[:8]
+    if "_id" not in cols:
+        cols = ["_id"] + cols
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join("---" for _ in cols) + " |"
+    rows = []
+    for d in docs:
+        cells = []
+        for c in cols:
+            val = d.get(c, "")
+            if isinstance(val, (dict, list)):
+                val = "..."
+            cells.append(str(val).replace("|", "\\|"))
+        rows.append("| " + " | ".join(cells) + " |")
+    return "\n".join([header, sep] + rows)
+
+
+async def do_manage_atlas(content: str, owner: Optional[str] = None) -> Dict:
+    """Handle manage_atlas tool calls: MongoDB-style document store."""
+    import json as _json
+    from services.atlas import worlds as atlas_worlds
+    from services.atlas import entities as atlas_entities
+    from services.atlas import documents as atlas_documents
+    from services.atlas import csv_io as atlas_csv
+    from services.atlas import relationships as atlas_relationships
+    from services.atlas import search as atlas_search
+    from services.atlas import clusters as atlas_clusters
+    from services.atlas import keys as atlas_keys
+    from services.atlas import queries as atlas_queries
+    from services.atlas.worlds import AtlasNotFoundError, AtlasAccessError
+
+    try:
+        args = _parse_tool_args(content)
+    except ValueError:
+        return {"error": "Invalid JSON arguments", "exit_code": 1}
+
+    action = (args.get("action") or "").replace("-", "_").strip().lower()
+    _ALIASES = {
+        "create": "create_world",
+        "query": "find",
+        "query_rows": "find",
+        "list_rows": "find",
+        "count_rows": "countdocuments",
+        "add_row": "insertone",
+        "update_row": "updateone",
+        "delete_row": "deleteone",
+        "import": "import_rows",
+        "export": "export_csv",
+        "get_schema": "get_schema",
+        "describe": "describe_collection",
+        "get_world": "describe_world",
+    }
+    if action in ("create_entity", "new_entity"):
+        action = "create_entity"
+    elif action == "create" and args.get("entity_id"):
+        action = "insertone"
+    elif action == "create" and (args.get("entity_name") or args.get("name")):
+        action = "create_entity"
+    elif action == "create":
+        action = "create_world"
+    action = _ALIASES.get(action, action)
+    _CAMEL = {
+        "findone": "findone", "countdocuments": "countdocuments",
+        "insertone": "insertone", "insertmany": "insertmany",
+        "updateone": "updateone", "updatemany": "updatemany",
+        "replaceone": "replaceone", "deleteone": "deleteone",
+        "deletemany": "deletemany", "describe_collection": "describe_collection",
+        "list_relationships": "list_relationships",
+        "create_relationship": "create_relationship",
+        "list_clusters": "list_clusters",
+        "create_cluster": "create_cluster",
+        "assign_entity_to_cluster": "assign_entity_to_cluster",
+        "find_world": "find_world", "find_entity": "find_entity",
+        "describe_world": "describe_world", "search": "search",
+        "list_keys": "list_keys", "create_key": "create_key",
+        "list_queries": "list_queries", "create_query": "create_query",
+        "update_query": "update_query", "execute_query": "execute_query",
+    }
+    action = _CAMEL.get(action, action)
+
+    def _resolve_world() -> tuple:
+        wid = args.get("world_id")
+        wname = args.get("world_name")
+        if wid or wname:
+            return atlas_worlds.resolve_world(owner, world_id=wid, world_name=wname), False
+        return atlas_worlds.resolve_default_world(owner), True
+
+    def _resolve_entity(world_id: str):
+        name = args.get("entity_name")
+        if not name and action not in ("create_world", "list_worlds", "create_entity", "find_world"):
+            name = args.get("name")
+        return atlas_entities.resolve_entity(
+            owner, world_id,
+            entity_id=args.get("entity_id"),
+            entity_name=name,
+        )
+
+    def _ctx_world(w, used_default=False, **extra):
+        return {**_atlas_world_context(w, used_default=used_default), **extra, "exit_code": 0}
+
+    def _ctx_entity(w, e, used_default=False, **extra):
+        return {
+            **_atlas_world_context(w, used_default=used_default),
+            **_atlas_entity_context(e),
+            **extra,
+            "exit_code": 0,
+        }
+
+    def _filter_obj():
+        f = args.get("filter")
+        if isinstance(f, dict):
+            return f
+        if args.get("filter_col") and args.get("filter_val") is not None:
+            col = args["filter_col"]
+            if col in ("_id", "_atlas_row_id"):
+                return {"_id": int(args["filter_val"])}
+            return {col: args["filter_val"]}
+        if args.get("row_id") or args.get("_id"):
+            return {"_id": int(args.get("row_id") or args.get("_id"))}
+        return {}
+
+    def _format_find_results(docs, entity_name, total, fmt, fields):
+        projected = [_atlas_project_doc(d, fields) for d in docs]
+        if fmt == "compact":
+            lines = [f"Showing {len(projected)} of {total} in **{entity_name}**:"]
+            lines.extend(_atlas_format_doc_compact(d) for d in projected)
+            return "\n".join(lines)
+        if fmt == "table":
+            lines = [f"Showing {len(projected)} of {total} in **{entity_name}**:"]
+            lines.append(_atlas_format_docs_table(projected, fields))
+            return "\n".join(lines)
+        lines = [f"Showing {len(projected)} of {total} in **{entity_name}**:"]
+        for d in projected:
+            lines.append("```json\n" + _json.dumps(d, indent=2) + "\n```")
+        return "\n".join(lines)
+
+    try:
+        if action == "list_worlds":
+            worlds = atlas_worlds.list_worlds(owner)
+            if not worlds:
+                return {"response": "No Atlas worlds yet.", "exit_code": 0}
+            lines = [_atlas_format_world_line(w) for w in worlds]
+            return {"results": "\n".join(lines), "worlds": worlds, "exit_code": 0}
+
+        if action == "find_world":
+            query = args.get("name") or args.get("world_name") or args.get("query") or ""
+            if not query.strip():
+                return {"error": "name or query required for find_world", "exit_code": 1}
+            matches = atlas_worlds.find_worlds(owner, query)
+            if not matches:
+                return {"response": f'No world matching "{query}".', "exit_code": 0}
+            lines = [_atlas_format_world_line(w) for w in matches]
+            return {"results": "\n".join(lines), "worlds": matches, "exit_code": 0}
+
+        if action == "create_world":
+            w = atlas_worlds.create_world(owner, args.get("name") or "New World", args.get("description") or "")
+            return {
+                "response": f'Created world "{w["name"]}" (world_id: `{w["id"]}`)',
+                "world_id": w["id"],
+                "world_name": w["name"],
+                "exit_code": 0,
+            }
+
+        world, used_default = _resolve_world()
+        include_fields = bool(args.get("include_fields"))
+
+        if action == "describe_world":
+            entities = atlas_entities.list_entities(
+                owner, world["id"], include_fields=include_fields,
+            )
+            lines = [
+                f'**{world["name"]}** — world_id: `{world["id"]}`',
+            ]
+            if world.get("description"):
+                lines.append(world["description"])
+            lines.append(f"{len(entities)} collections, {world['row_count']} documents total:")
+            lines.extend(_atlas_format_entity_line(e, include_fields=include_fields) for e in entities)
+            summaries = [atlas_entities.entity_summary(e) for e in entities]
+            return _ctx_world(world, used_default, results="\n".join(lines), entities=summaries)
+
+        if action == "find_entity":
+            query = args.get("name") or args.get("entity_name") or args.get("query") or ""
+            if not query.strip():
+                return {"error": "name or query required for find_entity", "exit_code": 1}
+            matches = atlas_entities.find_entities(
+                owner, world["id"], query, include_fields=include_fields,
+            )
+            if not matches:
+                return _ctx_world(
+                    world, used_default,
+                    response=f'No collection matching "{query}" in {world["name"]}.',
+                )
+            lines = [_atlas_format_entity_line(e, include_fields=include_fields) for e in matches]
+            summaries = [atlas_entities.entity_summary(e) for e in matches]
+            return _ctx_world(world, used_default, results="\n".join(lines), entities=summaries)
+
+        if action == "list_entities":
+            entities = atlas_entities.list_entities(
+                owner, world["id"], include_fields=include_fields,
+            )
+            if not entities:
+                return _ctx_world(world, used_default, response="No entities in this world.")
+            lines = [_atlas_format_entity_line(e, include_fields=include_fields) for e in entities]
+            summaries = [atlas_entities.entity_summary(e) for e in entities]
+            return _ctx_world(world, used_default, results="\n".join(lines), entities=summaries)
+
+        if action == "create_entity":
+            e = atlas_entities.create_entity(
+                owner, world["id"],
+                args.get("name") or args.get("entity_name") or "Untitled",
+                description=args.get("description") or "",
+            )
+            return {
+                "response": f'Created collection "{e["name"]}" (entity_id: `{e["id"]}`)',
+                **_atlas_world_context(world, used_default=used_default),
+                **_atlas_entity_context(e),
+                "exit_code": 0,
+            }
+
+        if action == "search":
+            query = args.get("query") or args.get("q") or ""
+            if not query.strip():
+                return {"error": "query required for search", "exit_code": 1}
+            limit = min(int(args.get("limit") or 10), 20)
+            hits = atlas_search.search_world(owner, world["id"], query, limit=limit)
+            if not hits:
+                return _ctx_world(
+                    world, used_default,
+                    response=f'No documents matching "{query}" in {world["name"]}.',
+                )
+            lines = [f'Search results for "{query}" in **{world["name"]}**:']
+            for h in hits:
+                lines.append(
+                    f"- **{h['entity_name']}** _id={h['_id']} — {h['snippet']}"
+                )
+            return _ctx_world(world, used_default, results="\n".join(lines), hits=hits)
+
+        if action == "list_relationships":
+            rels = atlas_relationships.list_relationships(owner, world["id"])
+            if not rels:
+                return _ctx_world(world, used_default, response="No relationships defined.")
+            ent_map = {e["id"]: e["name"] for e in atlas_entities.list_entities(owner, world["id"])}
+            lines = []
+            for r in rels:
+                from_name = ent_map.get(r["from_entity_id"], r["from_entity_id"][:8])
+                to_name = ent_map.get(r["to_entity_id"], r["to_entity_id"][:8])
+                lines.append(
+                    f"- {r['rel_type']}: {from_name}.{r['from_field']} → {to_name}.{r['to_field']}"
+                )
+            return _ctx_world(world, used_default, results="\n".join(lines))
+
+        if action == "create_relationship":
+            from_e = atlas_entities.resolve_entity(
+                owner, world["id"],
+                entity_id=args.get("from_entity_id"),
+                entity_name=args.get("from_entity_name"),
+            )
+            to_e = atlas_entities.resolve_entity(
+                owner, world["id"],
+                entity_id=args.get("to_entity_id"),
+                entity_name=args.get("to_entity_name"),
+            )
+            from_key_id = args.get("from_key_id")
+            to_key_id = args.get("to_key_id")
+            if from_key_id and to_key_id:
+                r = atlas_relationships.create_relationship(
+                    owner, world["id"],
+                    from_e["id"], to_e["id"],
+                    args.get("rel_type") or "one_to_many",
+                    from_key_id=from_key_id, to_key_id=to_key_id,
+                    label=args.get("label") or "",
+                    from_cardinality=args.get("from_cardinality"),
+                    to_cardinality=args.get("to_cardinality"),
+                )
+                fk = r.get("from_key", {}).get("name", "")
+                tk = r.get("to_key", {}).get("name", "")
+                msg = f"Created relationship {from_e['name']}.{fk} → {to_e['name']}.{tk}"
+            else:
+                if not (args.get("from_field") is not None and args.get("to_field") is not None):
+                    return {"error": "from_key_id/to_key_id or from_field/to_field required", "exit_code": 1}
+                r = atlas_relationships.create_relationship(
+                    owner, world["id"],
+                    from_e["id"], to_e["id"],
+                    args.get("rel_type") or "one_to_many",
+                    args["from_field"], args["to_field"],
+                    label=args.get("label") or "",
+                    from_cardinality=args.get("from_cardinality"),
+                    to_cardinality=args.get("to_cardinality"),
+                )
+                msg = f"Created relationship {from_e['name']}.{args['from_field']} → {to_e['name']}.{args['to_field']}"
+            return _ctx_world(world, used_default, response=msg, relationship_id=r["id"])
+
+        if action == "list_keys":
+            entity = _resolve_entity(world["id"])
+            keys = atlas_keys.list_keys(owner, world["id"], entity["id"])
+            return _ctx_entity(world, entity, used_default, keys=keys)
+
+        if action == "create_key":
+            entity = _resolve_entity(world["id"])
+            slugs = args.get("field_slugs") or args.get("fields") or []
+            if not args.get("name") or not slugs:
+                return {"error": "name and field_slugs are required", "exit_code": 1}
+            key = atlas_keys.create_key(owner, world["id"], entity["id"], args["name"], slugs)
+            return _ctx_entity(world, entity, used_default, response=f"Created key {key['name']}", key=key)
+
+        if action == "list_queries":
+            queries = atlas_queries.list_queries(owner, world["id"])
+            return _ctx_world(world, used_default, queries=queries)
+
+        if action == "create_query":
+            if not args.get("name") or not args.get("sql_text"):
+                return {"error": "name and sql_text are required", "exit_code": 1}
+            q = atlas_queries.create_query(
+                owner, world["id"], args["name"], args["sql_text"],
+                description=args.get("description") or "",
+            )
+            return _ctx_world(world, used_default, response=f"Created query {q['name']}", query=q)
+
+        if action == "update_query":
+            qid = args.get("query_id")
+            qname = args.get("query_name")
+            if not qid and qname:
+                for q in atlas_queries.list_queries(owner, world["id"]):
+                    if q["name"].lower() == qname.lower():
+                        qid = q["id"]
+                        break
+            if not qid:
+                return {"error": "query_id or query_name required", "exit_code": 1}
+            q = atlas_queries.update_query(
+                owner, world["id"], qid,
+                name=args.get("rename"),
+                sql_text=args.get("sql_text"),
+                description=args.get("description"),
+            )
+            return _ctx_world(world, used_default, response=f"Updated query {q['name']}", query=q)
+
+        if action == "execute_query":
+            qid = args.get("query_id")
+            qname = args.get("query_name") or args.get("name")
+            if not qid and qname:
+                for q in atlas_queries.list_queries(owner, world["id"]):
+                    if q["name"].lower() == qname.lower():
+                        qid = q["id"]
+                        break
+            if not qid:
+                return {"error": "query_id or query_name required", "exit_code": 1}
+            result = atlas_queries.execute_query(
+                owner, world["id"], qid,
+                limit=int(args.get("limit") or 20),
+                offset=int(args.get("offset") or 0),
+            )
+            return _ctx_world(world, used_default, documents=result["documents"], total=result["total"])
+
+        if action == "list_clusters":
+            clusters = atlas_clusters.list_clusters(owner, world["id"])
+            if not clusters:
+                return _ctx_world(world, used_default, response="No clusters defined.")
+            cluster_map = {c["id"]: c["name"] for c in clusters}
+            lines = []
+            for c in clusters:
+                parent = cluster_map.get(c.get("parent_cluster_id"), "")
+                parent_note = f" (in {parent})" if parent else ""
+                lines.append(f"- **{c['name']}** — cluster_id: `{c['id'][:8]}`{parent_note}")
+            return _ctx_world(world, used_default, results="\n".join(lines), clusters=clusters)
+
+        if action == "create_cluster":
+            parent = None
+            if args.get("parent_cluster_id") or args.get("parent_cluster_name"):
+                parent_c = atlas_clusters.resolve_cluster(
+                    owner, world["id"],
+                    cluster_id=args.get("parent_cluster_id"),
+                    cluster_name=args.get("parent_cluster_name"),
+                )
+                parent = parent_c["id"]
+            c = atlas_clusters.create_cluster(
+                owner, world["id"],
+                args.get("name") or args.get("cluster_name") or "New Cluster",
+                description=args.get("description") or "",
+                parent_cluster_id=parent,
+                color=args.get("color") or "",
+            )
+            return _ctx_world(
+                world, used_default,
+                response=f'Created cluster "{c["name"]}" (cluster_id: `{c["id"]}`)',
+                cluster_id=c["id"],
+            )
+
+        if action == "assign_entity_to_cluster":
+            entity = atlas_entities.resolve_entity(
+                owner, world["id"],
+                entity_id=args.get("entity_id"),
+                entity_name=args.get("entity_name"),
+            )
+            cluster_id = None
+            if args.get("cluster_id") or args.get("cluster_name"):
+                cluster = atlas_clusters.resolve_cluster(
+                    owner, world["id"],
+                    cluster_id=args.get("cluster_id"),
+                    cluster_name=args.get("cluster_name"),
+                )
+                cluster_id = cluster["id"]
+            atlas_clusters.assign_entity_to_cluster(
+                owner, world["id"], entity["id"], cluster_id,
+            )
+            if cluster_id:
+                c = atlas_clusters.get_cluster(owner, world["id"], cluster_id)
+                msg = f'Assigned **{entity["name"]}** to cluster **{c["name"]}**'
+            else:
+                msg = f'Removed **{entity["name"]}** from all clusters'
+            return _ctx_entity(world, entity, used_default, response=msg)
+
+        entity = _resolve_entity(world["id"])
+        fields = args.get("fields")
+        if isinstance(fields, str):
+            fields = [f.strip() for f in fields.split(",") if f.strip()]
+        fmt = (args.get("format") or "json").strip().lower()
+
+        if action in ("get_schema", "describe_collection"):
+            schema = atlas_documents.get_entity_schema(
+                owner, world["id"], entity["id"],
+                include_stats=bool(args.get("include_stats")),
+                include_sparse=bool(args.get("include_sparse")),
+            )
+            lines = [
+                f"**{schema['entity_name']}** — {schema['document_count']} documents",
+                "Fields: " + (", ".join(
+                    f"{f['slug']} ({f['inferred_type']})" for f in schema.get("fields", [])
+                ) or "(none yet)"),
+            ]
+            if schema.get("sample_document"):
+                lines.append("Sample:\n```json\n" + _json.dumps(schema["sample_document"], indent=2) + "\n```")
+            return _ctx_entity(world, entity, used_default, results="\n".join(lines), schema=schema)
+
+        if action == "find":
+            limit = min(int(args.get("limit") or 20), 100)
+            offset = int(args.get("offset") or 0)
+            result = atlas_documents.find(
+                owner, world["id"], entity["id"],
+                filter_obj=_filter_obj() or None,
+                limit=limit, offset=offset,
+                sort=args.get("sort"),
+            )
+            if not result["documents"]:
+                return _ctx_entity(
+                    world, entity, used_default,
+                    response=f"No documents in {entity['name']} (total: {result['total']}).",
+                )
+            text = _format_find_results(
+                result["documents"], entity["name"], result["total"], fmt, fields,
+            )
+            return _ctx_entity(world, entity, used_default, results=_truncate(text))
+
+        if action == "findone":
+            doc = atlas_documents.find_one(owner, world["id"], entity["id"], _filter_obj() or None)
+            if not doc:
+                return _ctx_entity(world, entity, used_default, response="No matching document.")
+            projected = _atlas_project_doc(doc, fields)
+            if fmt == "compact":
+                text = _atlas_format_doc_compact(projected)
+            elif fmt == "table":
+                text = _atlas_format_docs_table([projected], fields)
+            else:
+                text = "```json\n" + _json.dumps(projected, indent=2) + "\n```"
+            return _ctx_entity(world, entity, used_default, results=text, document=projected)
+
+        if action == "countdocuments":
+            n = atlas_documents.count_documents(owner, world["id"], entity["id"], _filter_obj() or None)
+            return _ctx_entity(
+                world, entity, used_default,
+                response=f"{entity['name']}: {n} documents",
+                count=n,
+            )
+
+        if action == "insertone":
+            doc = args.get("document") or args.get("row") or args.get("data") or {}
+            if not doc:
+                doc = {k: v for k, v in args.items() if k not in (
+                    "action", "world_id", "world_name", "entity_id", "entity_name",
+                    "name", "owner", "filter", "update", "format", "fields")}
+            r = atlas_documents.insert_one(owner, world["id"], entity["id"], doc)
+            return {
+                "response": f"Inserted document _id={r['inserted_id']}",
+                "inserted_id": r["inserted_id"],
+                "row_id": r["inserted_id"],
+                **_atlas_world_context(world, used_default=used_default),
+                **_atlas_entity_context(entity),
+                "exit_code": 0,
+            }
+
+        if action == "insertmany":
+            docs = args.get("documents") or args.get("rows") or []
+            r = atlas_documents.insert_many(owner, world["id"], entity["id"], docs)
+            return _ctx_entity(
+                world, entity, used_default,
+                response=f"Inserted {r['inserted_count']} documents",
+                inserted_ids=r["inserted_ids"],
+            )
+
+        if action == "updateone":
+            filt = _filter_obj() or None
+            if not filt and (args.get("row_id") or args.get("_id")):
+                filt = {"_id": int(args.get("row_id") or args.get("_id"))}
+            upd = args.get("update") or args.get("row") or args.get("data") or {}
+            if not upd:
+                upd = {k: v for k, v in args.items() if k not in (
+                    "action", "world_id", "world_name", "entity_id", "entity_name",
+                    "filter", "row_id", "_id", "upsert", "confirm", "format", "fields")}
+            r = atlas_documents.update_one(
+                owner, world["id"], entity["id"], filt, upd,
+                upsert=bool(args.get("upsert")),
+            )
+            msg = f"matched={r.get('matched_count', 0)} modified={r.get('modified_count', 0)}"
+            if r.get("upserted_id"):
+                msg = f"created _id={r['upserted_id']}"
+            return _ctx_entity(world, entity, used_default, response=msg, **r)
+
+        if action == "updatemany":
+            upd = args.get("update") or {}
+            r = atlas_documents.update_many(
+                owner, world["id"], entity["id"], _filter_obj() or None, upd,
+            )
+            return _ctx_entity(
+                world, entity, used_default,
+                response=f"matched={r['matched_count']} modified={r['modified_count']}",
+                **r,
+            )
+
+        if action == "replaceone":
+            r = atlas_documents.replace_one(
+                owner, world["id"], entity["id"],
+                _filter_obj() or None,
+                args.get("replacement") or args.get("document") or {},
+                upsert=bool(args.get("upsert")),
+            )
+            msg = f"matched={r.get('matched_count', 0)}"
+            if r.get("upserted_id"):
+                msg = f"created _id={r['upserted_id']}"
+            return _ctx_entity(world, entity, used_default, response=msg, **r)
+
+        if action == "deleteone":
+            r = atlas_documents.delete_one(owner, world["id"], entity["id"], _filter_obj() or None)
+            return _ctx_entity(
+                world, entity, used_default,
+                response=f"deleted={r['deleted_count']}", **r,
+            )
+
+        if action == "deletemany":
+            try:
+                r = atlas_documents.delete_many(
+                    owner, world["id"], entity["id"],
+                    _filter_obj() or None,
+                    confirm=bool(args.get("confirm")),
+                )
+            except ValueError as e:
+                return {
+                    **_atlas_world_context(world, used_default=used_default),
+                    **_atlas_entity_context(entity),
+                    "error": str(e),
+                    "exit_code": 1,
+                }
+            return _ctx_entity(
+                world, entity, used_default,
+                response=f"deleted={r['deleted_count']}", **r,
+            )
+
+        if action == "import_rows":
+            csv_text = args.get("csv") or args.get("csv_text") or args.get("content") or ""
+            if not csv_text:
+                return {"error": "csv text required for import_rows", "exit_code": 1}
+            stats = atlas_csv.import_rows(
+                owner, world["id"], entity["id"], csv_text,
+                mode=args.get("mode") or "append",
+            )
+            return _ctx_entity(
+                world, entity, used_default,
+                response=(
+                    f"Import complete: {stats['rows_inserted']} inserted, "
+                    f"{stats['rows_updated']} updated, {stats['rows_failed']} failed"
+                ),
+                stats=stats,
+            )
+
+        if action == "export_csv":
+            text = atlas_csv.export_csv(owner, world["id"], entity["id"])
+            return _ctx_entity(world, entity, used_default, results=_truncate(text))
+
+        return {"error": f"Unknown action: {action}", "exit_code": 1}
+
+    except (AtlasNotFoundError, AtlasAccessError) as e:
+        return {"error": str(e), "exit_code": 1}
+    except ValueError as e:
+        return {"error": str(e), "exit_code": 1}
+    except Exception as e:
+        logger.error(f"manage_atlas error: {e}", exc_info=True)
+        return {"error": str(e), "exit_code": 1}
+
+
+# ---------------------------------------------------------------------------
 # Calendar tool — CalDAV-backed event CRUD
 # ---------------------------------------------------------------------------
 
@@ -2343,6 +3011,18 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
     method = (args.get("method") or "GET").upper()
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
         return {"error": f"Unsupported method: {method}", "exit_code": 1}
+    if "/api/atlas/" in path:
+        return {
+            "error": (
+                "Don't hit /api/atlas/* via app_api — use the manage_atlas tool. "
+                "describe_world, list_entities, get_schema, find, list_queries, "
+                "create_query, and update_query are actions inside manage_atlas "
+                "(not separate tools). Example: "
+                '{"action":"get_schema","world_id":"CG-BMS","entity_name":"Customers"} '
+                'or {"action":"list_queries","world_id":"CG-BMS"}.'
+            ),
+            "exit_code": 1,
+        }
     if any(method == m and path.startswith(p) for m, p in _APP_API_BLOCKLIST_METHOD_PATH):
         if "/api/email/accounts" in path:
             return {"error": "Don't use /api/email/accounts via app_api — it is owner-filtered in tool context and may return empty. Use the `list_email_accounts` email tool, then pass `account` to list_emails/read_email.", "exit_code": 1}

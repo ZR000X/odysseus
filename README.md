@@ -22,6 +22,7 @@ A self-hosted AI workspace -- meant to be the self-hosted version of the UI expe
   - **Memory / Skills** -- Persistent memory and skills, your agent evolves over time as it better understands you and your tasks!<br>　<sub>ChromaDB · fastembed (ONNX) · vector + keyword retrieval · import/export</sub>
   - **Email** -- IMAP/SMTP inbox with AI triage built in: urgency reminders, auto-tag, auto-summary, auto-reply drafts, auto-spam.<br>　<sub>IMAP · SMTP · per-account routing · CalDAV-aware</sub>
   - **Notes & Tasks** -- Quick notes with reminders, a todo list, and scheduled tasks the agent can act on.<br>　<sub>note pings · checklist · cron-style tasks · ntfy / browser / email channels</sub>
+  - **Atlas** -- structured data worlds: define entities, store rows in SQLite, browse in the UI, read/write from chat.<br>　<sub>worlds · entities · CSV export · manage_atlas agent tool · see [docs/atlas.md](docs/atlas.md)</sub>
   - **Calendar** -- Local-first calendar with CalDAV sync to Radicale / Nextcloud / Apple / Fastmail.<br>　<sub>CalDAV pull · .ics import/export · per-calendar colors · agent-aware</sub>
   - **Works on mobile** -- looks and runs great on your phone, not just desktop.<br>　<sub>responsive · installable (PWA) · touch gestures</sub>
   - **Extras** -- more to explore, happy if you give it a go!<br>　<sub>image editor · theme editor · file uploads (vision + PDF) · web search · presets · sessions · 2FA</sub>
@@ -72,6 +73,98 @@ Open `http://localhost:7000` when the containers are healthy. Docker Compose
 binds the web UI to `127.0.0.1` by default. If the port is taken, set
 `APP_PORT=7001` in `.env` and recreate the container. Set `APP_BIND=0.0.0.0`
 only when you intentionally want LAN/reverse-proxy access.
+
+#### Parallel dev stack (optional)
+
+To run a **second** Compose project alongside an existing install (separate
+ports and data — production on `:7000` stays up):
+
+```bash
+cp .env.dev.example .env.dev
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --build
+```
+
+Open `http://localhost:7001`. Stop or inspect **only** the dev stack with the
+same `-f` / `--env-file .env.dev` flags (`down`, `logs odysseus`, etc.). A plain
+`docker compose down` without those flags affects whichever project your default
+`.env` points at.
+
+**First-login admin password** is printed once at container startup when
+`data-dev/auth.json` is created (dev credentials are separate from production
+`data/auth.json`). Always pass the dev compose flags — a plain
+`docker compose logs odysseus` only shows the production stack:
+
+```bash
+# Dev stack
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs odysseus | grep -i password
+
+# Production (default project)
+docker compose logs odysseus | grep -i password
+```
+
+PowerShell:
+
+```powershell
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs odysseus | Select-String -Pattern password
+```
+
+If you missed the one-time log line, see [Forgot admin password?](#forgot-admin-password)
+below.
+
+GPU on dev: add `-f docker/gpu.nvidia.yml` (or `gpu.amd.yml`) after `docker/dev.yml` (see `.env.dev.example`).
+
+#### Forgot admin password?
+
+Passwords are stored as bcrypt hashes in `data/auth.json` (production) or
+`data-dev/auth.json` (parallel dev stack). **There is no command to read the
+original password back** — you can only reset it.
+
+The one-time `Temporary password:` log line appears **only when `auth.json` is
+first created**. If that file already exists, startup logs say
+`auth.json already exists` and no password is printed.
+
+**Option A — recreate admin via env (keeps other data):**
+
+1. Set `ODYSSEUS_ADMIN_PASSWORD=your_new_password` in `.env` (production) or
+   `.env.dev` (dev stack).
+2. Delete the auth file on the host: `data/auth.json` or `data-dev/auth.json`.
+3. Recreate the Odysseus container (add dev `-f` / `--env-file` flags if needed):
+   ```bash
+   docker compose up -d --force-recreate odysseus
+   # dev stack:
+   docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --force-recreate odysseus
+   ```
+
+**Option B — patch hash in the running container (fast break-glass):**
+
+Replace `YOUR_NEW_PASSWORD` below. Use the compose flags that match your stack.
+
+```bash
+# Production (default project, auth at ./data/auth.json)
+docker compose exec odysseus python -c "import json, bcrypt; p='/app/data/auth.json'; d=json.load(open(p)); u='admin'; d['users'][u]['password_hash']=bcrypt.hashpw(b'YOUR_NEW_PASSWORD', bcrypt.gensalt()).decode(); json.dump(d, open(p,'w'), indent=2)"
+docker compose restart odysseus
+
+# Parallel dev stack (auth at ./data-dev/auth.json)
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev exec odysseus python -c "import json, bcrypt; p='/app/data/auth.json'; d=json.load(open(p)); u='admin'; d['users'][u]['password_hash']=bcrypt.hashpw(b'YOUR_NEW_PASSWORD', bcrypt.gensalt()).decode(); json.dump(d, open(p,'w'), indent=2)"
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev restart odysseus
+```
+
+PowerShell is the same commands; only the log-grep examples above use
+`Select-String` instead of `grep`.
+
+**Important:** after Option B you **must restart** the Odysseus container.
+The app loads `auth.json` into memory at startup; editing the file on disk
+alone does not update the running process until restart.
+
+If the username is not `admin`, list accounts first:
+
+```bash
+docker compose exec odysseus python -c "import json; print(list(json.load(open('/app/data/auth.json'))['users'].keys()))"
+```
+
+(`docker ps` shows container names like `odysseus-odysseus-1` or
+`odysseus-dev-odysseus-1`; prefer the `docker compose exec odysseus` form
+above so Compose resolves the right container for your project.)
 
 ### Native Linux / macOS
 ```bash

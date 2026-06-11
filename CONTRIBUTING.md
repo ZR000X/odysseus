@@ -31,6 +31,23 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+**Parallel Docker dev instance** — when a production stack is already running
+and you want an isolated copy for branch testing (separate `./data-dev`, port
+7001):
+
+```bash
+cp .env.dev.example .env.dev
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev up -d --build
+# → http://localhost:7001
+
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev logs --tail=120 odysseus
+docker compose -f docker-compose.yml -f docker/dev.yml --env-file .env.dev down   # stops dev only
+```
+
+Forgot the dev-stack admin password? See **Forgot admin password?** in
+[README.md](README.md#forgot-admin-password) (patch `data-dev/auth.json` via
+`docker compose … exec odysseus`, then restart the container).
+
 Manual development uses Python 3.11+:
 
 ```bash

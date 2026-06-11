@@ -1086,11 +1086,25 @@ document.addEventListener('click', function(e) {
   if (!a) return;
   const href = a.getAttribute('href') || '';
   if (!href.startsWith('#')) return;
-  const m = href.match(/^#(session|document|note|image|email|event|task|skill|research)-(.+)$/);
+  const m = href.match(/^#(session|document|note|image|email|event|task|skill|research|atlas-world|atlas-entity)-(.+)$/);
   if (!m) return;
   e.preventDefault();
   e.stopPropagation();
   const [, kind, id] = m;
+  if (kind === 'atlas-world') {
+    import('./atlas.js').then(mod => {
+      const fn = mod.openPanel || (mod.default && mod.default.openPanel);
+      if (fn) fn({ worldId: id });
+    }).catch(() => {});
+    return;
+  }
+  if (kind === 'atlas-entity') {
+    import('./atlas.js').then(mod => {
+      const fn = mod.openPanel || (mod.default && mod.default.openPanel);
+      if (fn) fn({ entityId: id });
+    }).catch(() => {});
+    return;
+  }
   if (kind === 'session') {
     import('./sessions.js').then(mod => {
       const fn = mod.selectSession || (mod.default && mod.default.selectSession);

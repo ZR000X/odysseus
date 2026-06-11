@@ -14,12 +14,16 @@ venv/
 .env
 .env.bak.*
 !.env.example
+.env.dev
+!.env.dev.example
 
 # Data — all user data stays local
 data/
+data-dev/
 !services/hwfit/data/
 !services/hwfit/data/hf_models.json
 logs/
+logs-dev/
 *.log
 *.db
 *.sqlite

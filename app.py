@@ -726,6 +726,9 @@ logger.info("Webhook & API token routes initialized")
 from routes.note_routes import setup_note_routes
 app.include_router(setup_note_routes(task_scheduler))
 
+from routes.atlas_routes import setup_atlas_routes
+app.include_router(setup_atlas_routes())
+
 # Email
 from routes.email_routes import setup_email_routes
 email_router = setup_email_routes()
@@ -809,6 +812,10 @@ async def serve_tasks(request: Request):
 
 @app.get("/library")
 async def serve_library(request: Request):
+    return await serve_index(request)
+
+@app.get("/atlas")
+async def serve_atlas(request: Request):
     return await serve_index(request)
 
 @app.get("/backgrounds")
